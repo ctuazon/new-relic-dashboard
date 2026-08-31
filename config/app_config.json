@@ -1,0 +1,88 @@
+{
+  "locations": [
+    {
+      "name": "AeroTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'AeroTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "AtvTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'AtvTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "Boatmart (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'Boatmart (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "CycleTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'CycleTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "EquipmentTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'EquipmentTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "PwcTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'PwcTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "RVTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'RVTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "SnowmobileTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'SnowmobileTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    },
+    {
+      "name": "TruckTrader (ECS)",
+      "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'TruckTrader (ECS)' SINCE 5 minutes ago",
+      "enabled": true,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.0
+    }
+  ],
+  "groups": [
+    {
+      "name": "All Locations Combined",
+      "members": [],
+      "custom_nrql": null,
+      "use_custom_threshold": true,
+      "custom_threshold": 1.2
+    }
+  ],
+  "settings": {
+    "poll_interval_seconds": 60,
+    "threshold_stdev_multiplier": 2.0,
+    "min_samples_for_auto_threshold": 5,
+    "flat_fallback_threshold_percent": 5.0,
+    "sound_enabled": true,
+    "tts_enabled": true,
+    "alert_repeat_seconds": 8,
+    "error_inbox_enabled": true,
+    "error_inbox_lookback_seconds": 3600,
+    "error_inbox_container_attribute": "containerId"
+  }
+}
