@@ -3,6 +3,7 @@ python-dotenv>=1.0
 pyttsx3>=2.90
 pywin32>=306; platform_system == "Windows"
 matplotlib>=3.8
+sv-ttk>=2.6
 
 # Only used to (re)generate assets/app_icon.ico via assets/generate_icon.py
 pillow>=10.0

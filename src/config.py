@@ -82,6 +82,7 @@ class Settings:
     min_transactions_for_alert: int = 20
     mini_view_x: Optional[int] = None
     mini_view_y: Optional[int] = None
+    theme: Optional[str] = None  # "light" / "dark"; None follows the Windows app theme
 
 
 @dataclass
