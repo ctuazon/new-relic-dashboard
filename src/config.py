@@ -80,6 +80,8 @@ class Settings:
     error_inbox_lookback_seconds: int = 3600
     error_inbox_container_attribute: str = "containerId"
     min_transactions_for_alert: int = 20
+    mini_view_x: Optional[int] = None
+    mini_view_y: Optional[int] = None
 
 
 @dataclass

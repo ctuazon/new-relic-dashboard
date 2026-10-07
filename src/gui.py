@@ -229,6 +229,209 @@ class ErrorInboxDialog(tk.Toplevel):
         self.detail_text.config(state="disabled")
 
 
+MINI_BG = "#ffffff"
+MINI_ALERT_BG = "#ffe0e0"
+MINI_BORDER = "#c8c8c8"
+MINI_FONT = ("Segoe UI", 9)
+MINI_FONT_BOLD = ("Segoe UI", 9, "bold")
+MINI_REFRESH_MS = 500
+MINI_STATUS_STYLES = {  # status -> (text, color)
+    "OK": ("OK", "#1e9e3a"),
+    "ANOMALY": ("ALERT", "#d00000"),
+    "ERROR": ("ERR", "#c77c00"),
+    "PENDING": ("...", "#888888"),
+    "BREACH": ("WARN", "#e05a00"),
+}
+
+
+def short_name(name: str) -> str:
+    """'CycleTrader (ECS)' -> 'Cycle', 'All Locations Combined' -> 'All' — keeps the strip thin."""
+    base = name.split("(")[0].strip()
+    if base.endswith("Trader") and len(base) > len("Trader"):
+        return base[:-len("Trader")]
+    return base.split()[0] if " " in base else base
+
+
+class MiniView(tk.Toplevel):
+    """Borderless always-on-top status strip shown while the main window is minimized.
+    Mirrors the dashboard status per series and offers ways back into the full UI."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app)
+        self.app = app
+        self.withdraw()
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.config(bg=MINI_BORDER)
+
+        self.body = tk.Frame(self, bg=MINI_BG)
+        self.body.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.handle = tk.Label(self.body, text="⋮⋮", bg=MINI_BG, fg="#999", font=MINI_FONT, cursor="fleur")
+        self.handle.pack(side="left", padx=(4, 2))
+        self.light = tk.Canvas(self.body, width=10, height=10, bg=MINI_BG, highlightthickness=0)
+        self.light_dot = self.light.create_oval(1, 1, 9, 9, fill="gray", outline="")
+        self.light.pack(side="left", padx=(2, 6))
+
+        self.items_frame = tk.Frame(self.body, bg=MINI_BG)
+        self.items_frame.pack(side="left")
+        self.placeholder = tk.Label(self.items_frame, text="Not monitoring", bg=MINI_BG, fg="#888",
+                                    font=MINI_FONT)
+        self._items = {}  # key -> (frame, name_label, status_label)
+
+        close_btn = tk.Label(self.body, text="✕", bg=MINI_BG, fg="#666", font=MINI_FONT, cursor="hand2")
+        close_btn.pack(side="right", padx=(2, 6))
+        close_btn.bind("<Button-1>", lambda e: self.app.show_full_view())
+        self.restore_btn = restore_btn = tk.Label(self.body, text="⤢", bg=MINI_BG, fg="#444", font=("Segoe UI", 11),
+                               cursor="hand2")
+        restore_btn.pack(side="right", padx=2)
+        restore_btn.bind("<Button-1>", lambda e: self.app.show_full_view())
+        self.silence_btn = tk.Label(self.body, text="Silence", bg="#b00020", fg="white",
+                                    font=MINI_FONT_BOLD, padx=6, cursor="hand2")
+        self.silence_btn.bind("<Button-1>", lambda e: self.app.alert_manager.acknowledge_all())
+        self._fixed_widgets = [self.body, self.handle, self.light, self.items_frame, self.placeholder,
+                               close_btn, restore_btn]
+
+        for w in (self.body, self.handle, self.items_frame, self.placeholder):
+            w.bind("<ButtonPress-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._on_drag)
+            w.bind("<ButtonRelease-1>", self._end_drag)
+        for w in self._fixed_widgets:
+            w.bind("<Button-3>", self._show_menu)
+            w.bind("<Double-1>", lambda e: self.app.show_full_view())
+        self._drag_offset = (0, 0)
+        self._shown = False
+
+    # ---------- visibility ----------
+    def show(self):
+        s = self.app.cfg.settings
+        self.refresh()
+        self.update_idletasks()
+        if s.mini_view_x is not None and s.mini_view_y is not None:
+            x, y = s.mini_view_x, s.mini_view_y
+        else:
+            x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+            y = 4
+        # Keep it reachable if the saved spot is now off-screen (e.g. monitor unplugged).
+        x = min(max(x, self.winfo_vrootx()), self.winfo_vrootx() + self.winfo_vrootwidth() - 40)
+        y = min(max(y, self.winfo_vrooty()), self.winfo_vrooty() + self.winfo_vrootheight() - 20)
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self._shown = True
+        self.after(MINI_REFRESH_MS, self._tick)
+
+    def hide(self):
+        self._shown = False
+        self.withdraw()
+
+    def _tick(self):
+        if not self._shown:
+            return
+        self.refresh()
+        # Some apps (fullscreen video, other topmost windows) can push us down; re-assert.
+        self.attributes("-topmost", True)
+        self.after(MINI_REFRESH_MS, self._tick)
+
+    # ---------- rendering ----------
+    def refresh(self):
+        app = self.app
+        self.light.itemconfig(self.light_dot, fill=app.light_canvas.itemcget(app.light, "fill"))
+
+        active_alerts = [a for a in app.alert_manager.active_alerts() if not a.acknowledged]
+        bg = MINI_ALERT_BG if active_alerts else MINI_BG
+        if active_alerts:
+            self.silence_btn.pack(side="right", padx=(2, 4), after=self.restore_btn)
+        else:
+            self.silence_btn.pack_forget()
+
+        states = list(app.monitor.states.values())
+        keys = [s.key for s in states]
+        if list(self._items.keys()) != keys:
+            for frame, _n, _s in self._items.values():
+                frame.destroy()
+            self._items = {}
+            for state in states:
+                self._items[state.key] = self._make_item(state)
+
+        if states:
+            self.placeholder.pack_forget()
+        else:
+            self.placeholder.pack(side="left", padx=4)
+
+        name_to_app = {loc.name: loc.app_name for loc in app.cfg.locations}
+        for state in states:
+            frame, name_label, status_label = self._items[state.key]
+            status = state.status
+            if status == "OK" and state.kind == "location":
+                app_name = name_to_app.get(state.name)
+                if app_name and app._breaching_apps.get(app_name):
+                    status = "BREACH"
+            text, color = MINI_STATUS_STYLES.get(status, (status, "#444"))
+            if state.key in app._new_error_iids:
+                text += " ●"
+            status_label.config(text=text, fg=color,
+                                font=MINI_FONT_BOLD if status in ("ANOMALY", "BREACH") else MINI_FONT)
+
+        if not app.monitor.is_running() and states:
+            self.placeholder.config(text="(stopped)")
+            self.placeholder.pack(side="left", padx=4)
+        else:
+            self.placeholder.config(text="Not monitoring")
+
+        for w in [*self._fixed_widgets, self.light]:
+            w.config(bg=bg)
+        for frame, name_label, status_label in self._items.values():
+            for w in (frame, name_label, status_label):
+                w.config(bg=bg)
+
+    def _make_item(self, state):
+        frame = tk.Frame(self.items_frame, bg=MINI_BG, cursor="hand2")
+        frame.pack(side="left", padx=(4, 10))
+        name_label = tk.Label(frame, text=short_name(state.name), bg=MINI_BG, fg="#222", font=MINI_FONT)
+        name_label.pack(side="left")
+        status_label = tk.Label(frame, text="", bg=MINI_BG, font=MINI_FONT)
+        status_label.pack(side="left", padx=(4, 0))
+        for w in (frame, name_label, status_label):
+            w.bind("<Button-1>", lambda e, k=state.key: self.app.show_full_view(focus_key=k))
+            w.bind("<Button-3>", self._show_menu)
+        return frame, name_label, status_label
+
+    # ---------- interaction ----------
+    def _start_drag(self, event):
+        self._drag_offset = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def _on_drag(self, event):
+        dx, dy = self._drag_offset
+        self.geometry(f"+{event.x_root - dx}+{event.y_root - dy}")
+
+    def _end_drag(self, event):
+        s = self.app.cfg.settings
+        s.mini_view_x, s.mini_view_y = self.winfo_x(), self.winfo_y()
+        self.app.cfg.save()
+
+    def _show_menu(self, event):
+        app = self.app
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Restore full view", command=app.show_full_view)
+        for text, tab in (("Dashboard", app.dashboard_tab), ("Locations & Groups", app.locations_tab),
+                          ("Settings", app.settings_tab), ("Logs", app.logs_tab)):
+            menu.add_command(label=f"Open {text}", command=lambda t=tab: app.show_full_view(tab=t))
+        menu.add_separator()
+        running = app.monitor.is_running()
+        menu.add_command(label="Stop Monitoring" if running else "Start Monitoring",
+                         command=app._toggle_monitoring)
+        menu.add_command(label="Refresh Now", command=app._refresh_now)
+        menu.add_command(label="Silence All", command=app.alert_manager.acknowledge_all)
+        menu.add_separator()
+        menu.add_command(label="Exit", command=app._on_close)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -268,6 +471,8 @@ class App(tk.Tk):
         )
 
         self._build_ui()
+        self.mini_view = MiniView(self)
+        self.bind("<Map>", self._on_main_map)
         self.after(POLL_UI_MS, self._drain_queue)
         self.after(LEGEND_PULSE_INTERVAL_MS, self._animate_legend)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -290,6 +495,7 @@ class App(tk.Tk):
         self.refresh_btn = ttk.Button(top, text="Refresh Now", command=self._refresh_now)
         self.refresh_btn.pack(side="left", padx=4)
         ttk.Button(top, text="Silence All", command=self.alert_manager.acknowledge_all).pack(side="left", padx=4)
+        ttk.Button(top, text="Mini View", command=self.show_mini_view).pack(side="right", padx=4)
 
         self.loading_bar = ttk.Progressbar(top, mode="indeterminate", length=110)
         self.loading_label = ttk.Label(top, text="", foreground="#555")
@@ -989,6 +1195,29 @@ class App(tk.Tk):
             else:
                 row = self._alert_widgets[alert.key]
                 row.winfo_children()[0].config(text=text)
+
+    # ---------- mini view ----------
+    def show_mini_view(self):
+        self.iconify()  # stays on the taskbar, so clicking it there also brings the full view back
+        self.mini_view.show()
+
+    def show_full_view(self, focus_key=None, tab=None):
+        self.mini_view.hide()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        if focus_key is not None:
+            tab = self.dashboard_tab
+            if self.tree.exists(focus_key):
+                self.tree.selection_set(focus_key)
+                self.tree.see(focus_key)
+        if tab is not None:
+            self.notebook.select(tab)
+
+    def _on_main_map(self, event):
+        # <Map> on the root also fires for every child widget; only react to the window itself.
+        if event.widget is self and self.mini_view._shown:
+            self.mini_view.hide()
 
     def _on_close(self):
         self.monitor.stop()
