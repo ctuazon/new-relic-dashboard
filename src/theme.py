@@ -35,6 +35,7 @@ PALETTES = {
         "mini_bg": "#ffffff", "mini_alert_bg": "#ffe0e0", "mini_border": "#c8c8c8",
         "mini_fg": "#222222", "mini_muted": "#888888", "mini_new_error": "#7b1fa2",
         "new_error_bg": "#0b3d0b", "new_error_fg": "#ffffff", "new_error_alert_bg": "#b71c1c",
+        "band": "#e4ebf5", "band_fg": "#0f2a4a", "accent": "#005fb8",
     },
     "dark": {
         "bg": "#1c1c1c", "surface": "#232323", "fg": "#fafafa", "muted": "#a8a8a8",
@@ -47,6 +48,7 @@ PALETTES = {
         "mini_bg": "#232323", "mini_alert_bg": "#4a1f22", "mini_border": "#4a4a4a",
         "mini_fg": "#eeeeee", "mini_muted": "#9a9a9a", "mini_new_error": "#ce93d8",
         "new_error_bg": "#2e7d32", "new_error_fg": "#ffffff", "new_error_alert_bg": "#c62828",
+        "band": "#2a3443", "band_fg": "#e6eefa", "accent": "#60cdff",
     },
 }
 
@@ -175,6 +177,12 @@ def apply_theme(root, name: str, ui_scale: float) -> dict:
     style.configure("Muted.TLabel", foreground=pal["muted"])
     style.configure("Strong.TLabel", font="SunValleyBodyStrongFont")
     style.configure("TLabelframe.Label", font="SunValleyBodyStrongFont")
+    # A tinted header band, so a window's title row reads as a tier above its toolbar.
+    style.configure("Band.TFrame", background=pal["band"])
+    style.configure("Band.TLabel", background=pal["band"], foreground=pal["band_fg"])
+    style.configure("BandStrong.TLabel", background=pal["band"], foreground=pal["band_fg"],
+                    font="SunValleyBodyStrongFont")
+    style.configure("BandMuted.TLabel", background=pal["band"], foreground=pal["muted"])
     set_dark_titlebar(root, name == "dark")
     return pal
 

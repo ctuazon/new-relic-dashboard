@@ -1,6 +1,7 @@
 """Tkinter desktop UI: connection light, live dashboard, location/group config, settings, logs."""
 import math
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -387,7 +388,23 @@ PR_LOG_RANGES = (("Last 15 minutes", 15), ("Last hour", 60), ("Last 6 hours", 36
 PR_LOG_FOLLOW_MS = 5000
 PR_LOG_MAX_LINES = 20000  # follow mode drops the oldest lines past this
 PR_LOG_ERROR_WORDS = ("error", "fatal", "exception", "critical", "panic", "uncaught")
+PR_LOG_WARN_WORDS = ("warn", "deprecat")
+PR_LOG_REGEX_DELAY_MS = 250  # regex filtering re-runs this long after the last keystroke
+# A line's own leading timestamp (e.g. PM2's "2026-10-13T17:48:01: "), which only repeats the
+# CloudWatch time already shown in the first column.
+PR_LOG_LEADING_TIME = re.compile(r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+                                 r"(?:Z|[+-]\d{2}:?\d{2})?\]?:?\s+")
 ALL_CONTAINERS = "All containers"
+
+
+def log_level(message: str) -> str:
+    """'error', 'warn' or '' for a log line, from the words in it."""
+    lowered = message.lower()
+    if any(w in lowered for w in PR_LOG_ERROR_WORDS):
+        return "error"
+    if any(w in lowered for w in PR_LOG_WARN_WORDS):
+        return "warn"
+    return ""
 
 
 class PrLogsDialog(tk.Toplevel):
@@ -400,6 +417,7 @@ class PrLogsDialog(tk.Toplevel):
         self.title(f"PR Logs (CloudWatch) — {change.target} PR #{change.pr_number}")
         scale = parent.ui_scale
         self.geometry(f"{int(1200 * scale)}x{int(680 * scale)}")
+        self.minsize(int(1160 * scale), int(400 * scale))  # narrower clips the toolbar
         pal = parent.palette
         self.configure(bg=pal["bg"])
         self.client = PrLogsClient(target.profile, target.region)
@@ -409,61 +427,121 @@ class PrLogsDialog(tk.Toplevel):
         self._busy = False
         self._refresh_pending = False  # a refresh asked for mid-load runs once that load is done
         self._follow_job = None
-        self._last_ts = None  # newest line shown; follow mode fetches only what's after it
+        self._regex_job = None
+        self._last_ts = None  # newest line loaded; follow mode fetches only what's after it
+        self._lines = []  # (LogLine, display text, level) for everything loaded; filters redraw from it
+        self._load_note = ""  # where the lines came from and when, shown after the line count
 
-        header = ttk.Frame(self)
-        header.pack(fill="x", padx=12, pady=(12, 0))
-        ttk.Label(header, text="Source: CloudWatch", style="Strong.TLabel").pack(side="left")
-        ttk.Label(header, text=f"  ·  container logs of {self.service} in cluster {self.cluster} "
-                               f"(profile {target.profile})", style="Muted.TLabel").pack(side="left")
+        def px(n):
+            return int(round(n * scale))
 
-        controls = ttk.Frame(self)
-        controls.pack(fill="x", padx=12, pady=(10, 0))
-        ttk.Label(controls, text="Container").pack(side="left", padx=(0, 6))
+        gap, label_gap = px(20), px(6)  # between control groups / between a label and its input
+
+        # Tier 1: what's being shown, on a tinted band. The profile is detail, so it's in a tooltip.
+        header = ttk.Frame(self, style="Band.TFrame", padding=(px(14), px(10)))
+        header.pack(fill="x")
+        service_label = ttk.Label(header, text=self.service, style="BandStrong.TLabel")
+        service_label.pack(side="left")
+        where_label = ttk.Label(header, text=f"   cluster {self.cluster}   ·   CloudWatch container logs",
+                                style="Band.TLabel")
+        where_label.pack(side="left")
+        info = ttk.Label(header, text="ⓘ", style="BandMuted.TLabel", cursor="question_arrow")
+        info.pack(side="right")
+        source_help = (f"Service: {self.service}\nCluster: {self.cluster}\nAWS profile: {target.profile}\n"
+                       f"Region: {target.region}\n\nRead from the containers' awslogs streams in CloudWatch.")
+        for widget in (service_label, where_label, info):
+            parent._add_tooltip(widget, source_help)
+
+        # Tier 2: what to load and how to narrow it.
+        controls = ttk.Frame(self, padding=(px(12), px(12), px(12), px(8)))
+        controls.pack(fill="x")
+        ttk.Label(controls, text="Container").pack(side="left", padx=(0, label_gap))
         self.container_var = tk.StringVar(value=ALL_CONTAINERS)
         self.container_combo = ttk.Combobox(controls, textvariable=self.container_var, state="readonly",
-                                            width=22, values=[ALL_CONTAINERS])
+                                            width=20, values=[ALL_CONTAINERS])
         self.container_combo.pack(side="left")
         self.container_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
-        ttk.Label(controls, text="Range").pack(side="left", padx=(16, 6))
+        ttk.Label(controls, text="Range").pack(side="left", padx=(gap, label_gap))
         self.range_var = tk.StringVar(value=PR_LOG_RANGES[1][0])
-        range_combo = ttk.Combobox(controls, textvariable=self.range_var, state="readonly", width=15,
+        range_combo = ttk.Combobox(controls, textvariable=self.range_var, state="readonly", width=14,
                                    values=[label for label, _m in PR_LOG_RANGES])
         range_combo.pack(side="left")
         range_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
-        ttk.Label(controls, text="Filter").pack(side="left", padx=(16, 6))
-        self.filter_var = tk.StringVar()
-        filter_entry = ttk.Entry(controls, textvariable=self.filter_var, width=24)
-        filter_entry.pack(side="left")
-        filter_entry.bind("<Return>", lambda e: self.refresh())
-        parent._add_tooltip(filter_entry, "A CloudWatch filter pattern, applied when you press Enter. Plain "
-                                          "words match lines containing all of them (case-sensitive), e.g. "
-                                          "ERROR; ?ERROR ?Fatal matches either.")
-        self.follow_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Follow", style="Switch.TCheckbutton", variable=self.follow_var,
-                        command=self._toggle_follow).pack(side="right")
-        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 12))
 
-        self.status = ttk.Label(self, style="Muted.TLabel", text="Looking up the containers' log locations…")
-        self.status.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(controls, text="Filter").pack(side="left", padx=(gap, label_gap))
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(controls, textvariable=self.filter_var, width=24)
+        self.filter_entry.pack(side="left")
+        self.filter_entry.bind("<Return>", lambda e: self._apply_filter(now=True))
+        self.filter_entry.bind("<Escape>", lambda e: self._clear_filter())
+        self.filter_var.trace_add("write", lambda *_: self._on_filter_typed())
+        # The clear button sits inside the entry's right edge, and only while there's text to clear.
+        self.clear_btn = tk.Label(self.filter_entry, text="✕", cursor="hand2", padx=px(4),
+                                  bg=pal["surface"], fg=pal["muted"], font="TkSmallCaptionFont")
+        self.clear_btn.bind("<Button-1>", lambda e: self._clear_filter())
+        parent._add_tooltip(self.clear_btn, "Clear the filter (Esc)")
+        self.regex_var = tk.BooleanVar(value=False)
+        regex_toggle = ttk.Checkbutton(controls, text=".*", style="Toggle.TButton", variable=self.regex_var,
+                                       command=self._toggle_regex)
+        regex_toggle.pack(side="left", padx=(label_gap, 0))
+        parent._add_tooltip(self.filter_entry, "With .* off: a CloudWatch filter pattern, applied when you "
+                                               "press Enter. Plain words match lines containing all of them "
+                                               "(case-sensitive), e.g. ERROR; ?ERROR ?Fatal matches either.\n\n"
+                                               "With .* on: a regular expression, case-insensitive, applied "
+                                               "as you type, e.g. timeout|ECONNRESET.")
+        parent._add_tooltip(regex_toggle, "Regex: filter with a regular expression as you type, instead of "
+                                          "a CloudWatch filter pattern")
+
+        ttk.Label(controls, text="Show").pack(side="left", padx=(gap, label_gap))
+        self.errors_only_var = tk.BooleanVar(value=False)
+        self.warnings_var = tk.BooleanVar(value=False)
+        errors_chip = ttk.Checkbutton(controls, text="Errors", style="Toggle.TButton",
+                                      variable=self.errors_only_var, command=self._render)
+        errors_chip.pack(side="left")
+        warnings_chip = ttk.Checkbutton(controls, text="Warnings", style="Toggle.TButton",
+                                        variable=self.warnings_var, command=self._render)
+        warnings_chip.pack(side="left", padx=(label_gap, 0))
+        parent._add_tooltip(errors_chip, "Only error lines (plus warnings, if that's on too). "
+                                         "Neither on shows every line.")
+        parent._add_tooltip(warnings_chip, "Only warning lines (plus errors, if that's on too). "
+                                           "Neither on shows every line.")
+        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="right")
+
+        # Tier 3: the log, with its view options and status in a footer along the bottom.
+        footer = ttk.Frame(self, padding=(px(12), px(6), px(12), px(10)))
+        footer.pack(side="bottom", fill="x")
+        self.status = ttk.Label(footer, style="Muted.TLabel", text="Looking up the containers' log locations…")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.follow_var = tk.BooleanVar(value=False)
+        follow = ttk.Checkbutton(footer, text="Follow", style="Switch.TCheckbutton", variable=self.follow_var,
+                                 command=self._toggle_follow)
+        follow.pack(side="right")
+        parent._add_tooltip(follow, f"Check for new lines every {PR_LOG_FOLLOW_MS // 1000} s and keep the "
+                                    f"newest in view")
+        self.wrap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(footer, text="Wrap lines", style="Switch.TCheckbutton", variable=self.wrap_var,
+                        command=self._apply_wrap).pack(side="right", padx=(0, gap))
 
         body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12, pady=12)
+        body.pack(fill="both", expand=True, padx=px(12))
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
         self.text = tk.Text(body, wrap="none", state="disabled", font="TkFixedFont", borderwidth=0,
-                            highlightthickness=0, padx=6, pady=4, bg=pal["surface"], fg=pal["fg"],
+                            highlightthickness=0, padx=px(8), pady=px(6), bg=pal["surface"], fg=pal["fg"],
                             insertbackground=pal["fg"])
         yscroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
-        xscroll = ttk.Scrollbar(body, orient="horizontal", command=self.text.xview)
-        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.xscroll = ttk.Scrollbar(body, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=self.xscroll.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
+        self.xscroll.grid(row=1, column=0, sticky="ew")
         self.text.tag_configure("time", foreground=pal["muted"])
-        self.text.tag_configure("container", foreground=pal["caution"])
-        self.text.tag_configure("error", foreground=pal["danger"])
+        self.text.tag_configure("container", foreground=pal["accent"])
+        # Level shows as both a row tint and a text color, so it doesn't rest on hue alone.
+        self.text.tag_configure("error", foreground=pal["danger"], background=pal["row_anomaly"])
+        self.text.tag_configure("warn", foreground=pal["warn"], background=pal["row_error"])
 
+        self.bind("<Control-f>", lambda e: self.filter_entry.focus_set())
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._run(lambda: self.client.container_logs(self.cluster, self.service), self._on_containers)
 
@@ -513,6 +591,10 @@ class PrLogsDialog(tk.Toplevel):
     def _range_minutes(self):
         return next(m for label, m in PR_LOG_RANGES if label == self.range_var.get())
 
+    def _server_pattern(self):
+        """The CloudWatch filter pattern; a regex filter is applied here instead, so it sends none."""
+        return "" if self.regex_var.get() else self.filter_var.get().strip()
+
     def refresh(self):
         if self._busy:
             self._refresh_pending = True
@@ -522,50 +604,132 @@ class PrLogsDialog(tk.Toplevel):
             self.status.config(text="Looking up the containers' log locations…")
             self._run(lambda: self.client.container_logs(self.cluster, self.service), self._on_containers)
             return
-        containers, pattern = self._selected_containers(), self.filter_var.get().strip()
+        containers, pattern = self._selected_containers(), self._server_pattern()
         since = time.time() - self._range_minutes() * 60
         self.status.config(text="Loading…")
         self._run(lambda: self.client.get_lines(containers, since, pattern), self._show_lines)
 
     def _show_lines(self, result):
         lines, truncated = result
+        self._lines = [self._entry(line) for line in lines]
+        self._last_ts = lines[-1].timestamp if lines else None
+        where = self.container_var.get().lower()
+        note = " (cut short: narrow the range or add a filter to see everything)" if truncated else ""
+        self._load_note = (f"from {where}, {self.range_var.get().lower()}{note} · "
+                           f"loaded {format_12h_time(time.time())}")
+        self._render()
+        self._schedule_follow()
+
+    @staticmethod
+    def _entry(line):
+        text = PR_LOG_LEADING_TIME.sub("", line.message, count=1)
+        return line, text, log_level(text)
+
+    # ---------- drawing ----------
+    def _line_filter(self):
+        """(predicate, problem) for the client-side filters (level chips and regex); the predicate
+        is None when none are on, and problem explains a regex that doesn't compile."""
+        levels = {level for level, var in (("error", self.errors_only_var), ("warn", self.warnings_var))
+                  if var.get()}
+        regex, problem = None, ""
+        if self.regex_var.get() and self.filter_var.get().strip():
+            try:
+                regex = re.compile(self.filter_var.get().strip(), re.IGNORECASE)
+            except re.error as e:
+                problem = f"regex not applied: {e}"
+        if not levels and regex is None:
+            return None, problem
+        return (lambda entry: (not levels or entry[2] in levels)
+                and (regex is None or regex.search(entry[1]) is not None)), problem
+
+    def _render(self):
+        """Redraws every loaded line that passes the filters, keeping the newest in view."""
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         self.text.config(state="disabled")
-        self._last_ts = None
-        self._append(lines)
+        self._insert(self._lines)
         self.text.see("end")
-        where = self.container_var.get().lower()
-        note = " (cut short: narrow the range or add a filter to see everything)" if truncated else ""
-        self.status.config(text=f"{len(lines)} line{'s' if len(lines) != 1 else ''} from {where}, "
-                                f"{self.range_var.get().lower()}{note} · loaded {format_12h_time(time.time())}")
-        self._schedule_follow()
 
-    def _append(self, lines):
-        if not lines:
-            return
-        at_bottom = self.text.yview()[1] >= 0.999
+    def _insert(self, entries):
+        keep, problem = self._line_filter()
         many = len(self._selected_containers()) > 1
-        width = max((len(c.container) for c in self.containers), default=0)
+        width = max((len(c.container) for c in self.containers), default=0) if many else 0
+        # Wrapped lines indent under the message, past the time (and container) column.
+        prefix_chars = len("00-00 00:00:00  ") + (width + 2 if many else 0)
+        self.text.tag_configure("line", lmargin2=tkfont.nametofont("TkFixedFont").measure("0" * prefix_chars))
         self.text.config(state="normal")
-        for line in lines:
+        for line, text, level in entries:
+            if keep is not None and not keep((line, text, level)):
+                continue
             stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(line.timestamp))
-            self.text.insert("end", stamp + "  ", "time")
+            self.text.insert("end", stamp + "  ", ("time", "line"))
             if many:
-                self.text.insert("end", line.container.ljust(width) + "  ", "container")
-            lowered = line.message.lower()
-            tag = "error" if any(w in lowered for w in PR_LOG_ERROR_WORDS) else ()
-            self.text.insert("end", line.message + "\n", tag)
+                self.text.insert("end", line.container.ljust(width) + "  ", ("container", "line"))
+            self.text.insert("end", text + "\n", (level, "line") if level else "line")
         excess = int(self.text.index("end-1c").split(".")[0]) - PR_LOG_MAX_LINES
         if excess > 0:
             self.text.delete("1.0", f"{excess + 1}.0")
         self.text.config(state="disabled")
-        self._last_ts = lines[-1].timestamp
-        if at_bottom:
-            self.text.see("end")
+        total = len(self._lines)
+        shown = total if keep is None else sum(1 for e in self._lines if keep(e))
+        count = f"{total} line{'s' if total != 1 else ''}" if keep is None else f"{shown} of {total} lines"
+        self.status.config(text=" · ".join(p for p in (f"{count} {self._load_note}".strip(), problem) if p))
+
+    def _apply_wrap(self):
+        top, at_bottom = self.text.index("@0,0"), self.text.yview()[1] >= 0.999
+        if self.wrap_var.get():
+            self.text.configure(wrap="word")
+            self.xscroll.grid_remove()
+        else:
+            self.text.configure(wrap="none")
+            self.xscroll.grid()
+        # Tk keeps stale hanging indents on lines drawn before the switch, so draw them afresh,
+        # staying on the same line unless the view was following the end.
+        self._render()
+        if not at_bottom:
+            self.text.yview(top)
+
+    # ---------- filter ----------
+    def _on_filter_typed(self):
+        if self.filter_var.get():
+            self.clear_btn.place(relx=1.0, rely=0.5, x=-2, anchor="e")
+        else:
+            self.clear_btn.place_forget()
+        if self.regex_var.get():  # a regex filters as you type; a CloudWatch pattern waits for Enter
+            self._apply_filter()
+
+    def _apply_filter(self, now=False):
+        if self._regex_job is not None:
+            self.after_cancel(self._regex_job)
+            self._regex_job = None
+        if not self.regex_var.get():
+            if now:
+                self.refresh()
+        elif now:
+            self._render()
+        else:
+            self._regex_job = self.after(PR_LOG_REGEX_DELAY_MS, self._apply_filter, True)
+
+    def _clear_filter(self):
+        had_pattern = bool(self._server_pattern())
+        self.filter_var.set("")
+        if had_pattern:
+            self.refresh()
+        else:
+            self._render()
+        self.filter_entry.focus_set()
+
+    def _toggle_regex(self):
+        # The text moves between CloudWatch and here, so reload when it was (or now isn't) sent there.
+        if self.filter_var.get().strip():
+            self.refresh()
+        else:
+            self._render()
 
     # ---------- follow (tail -f) ----------
     def _toggle_follow(self):
+        if self.follow_var.get():
+            self.text.see("end")
         self._schedule_follow()
 
     def _schedule_follow(self):
@@ -580,22 +744,29 @@ class PrLogsDialog(tk.Toplevel):
         if self._busy or not self.containers:
             self._schedule_follow()
             return
-        # CloudWatch times are whole milliseconds, so start 1 ms after the newest line shown.
+        # CloudWatch times are whole milliseconds, so start 1 ms after the newest line loaded.
         since = (self._last_ts + 0.001) if self._last_ts else time.time() - PR_LOG_FOLLOW_MS / 1000
-        containers, pattern = self._selected_containers(), self.filter_var.get().strip()
+        containers, pattern = self._selected_containers(), self._server_pattern()
 
         def done(result):
             lines, _truncated = result
-            self._append(lines)
-            self.status.config(text=f"Following: {len(lines)} new line{'s' if len(lines) != 1 else ''} · "
-                                    f"checked {format_12h_time(time.time())}")
+            at_bottom = self.text.yview()[1] >= 0.999
+            entries = [self._entry(line) for line in lines]
+            self._lines = (self._lines + entries)[-PR_LOG_MAX_LINES:]
+            if lines:
+                self._last_ts = lines[-1].timestamp
+            self._load_note = f"following, {len(lines)} new · checked {format_12h_time(time.time())}"
+            self._insert(entries)
+            if at_bottom:
+                self.text.see("end")
             self._schedule_follow()
 
         self._run(lambda: self.client.get_lines(containers, since, pattern), done)
 
     def _close(self):
-        if self._follow_job is not None:
-            self.after_cancel(self._follow_job)
+        for job in (self._follow_job, self._regex_job):
+            if job is not None:
+                self.after_cancel(job)
         self.destroy()
 
 
