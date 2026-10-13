@@ -64,6 +64,22 @@ CLOUDTRAIL_TIMING_NOTE = (
     "which takes a few seconds.\n"
     "• CloudTrail itself can take up to about 15 minutes to report a change, so a deploy may "
     "show up here a little after it happened.")
+# The error rate (New Relic) and log error count (CloudWatch) are tracked separately and never
+# mixed; only Status combines them. These spell that out wherever the two sit side by side.
+NR_ONLY_NOTE = ("Error Rate comes only from New Relic: the % of APM transactions that errored. "
+                "CloudWatch log lines are not part of it.")
+CW_ONLY_NOTE = ("Log Errors comes only from CloudWatch: a count of error log lines, with its own "
+                "threshold. It is not part of the New Relic error rate.")
+STATUS_SOURCES_NOTE = "Status shows whichever of the two is worse; their numbers are never combined."
+HEADING_TOOLTIPS = {
+    "#0": "Worse of New Relic and CloudWatch. " + STATUS_SOURCES_NOTE,
+    "value": NR_ONLY_NOTE,
+    "threshold": "Threshold for the New Relic error rate (custom or automatic). "
+                 "Log Errors (CW) has its own threshold, shown in that column.",
+    "logs": CW_ONLY_NOTE + " Shown as count / threshold.",
+    "errors": "Latest New Relic APM error for this location.",
+    "logerrs": "Latest CloudWatch error log line for this location.",
+}
 LEGEND_PULSE_INTERVAL_MS = 150
 LEGEND_PULSE_AMPLITUDE = 3.5
 LEGEND_PULSE_PERIOD_S = 1.0
@@ -1207,13 +1223,13 @@ class App(tk.Tk):
         self.tree.heading("#0", text="Status", anchor="w")
         self.tree.column("#0", width=self._px(140), minwidth=self._px(120), anchor="w", stretch=False)
         headings = {
-            "name": "Name", "kind": "Type", "value": "Error Rate", "threshold": "Threshold",
-            "logs": "Log Errors", "updated": "Last Updated", "errors": "Error Inbox (New Relic)",
+            "name": "Name", "kind": "Type", "value": "Error Rate (NR)", "threshold": "Threshold (NR)",
+            "logs": "Log Errors (CW)", "updated": "Last Updated", "errors": "Error Inbox (New Relic)",
             "logerrs": "Log Inbox (CloudWatch)",
         }
         # Text left-aligned, numbers right-aligned so values line up for vertical scanning.
-        layout = {"name": (175, "w"), "kind": (80, "w"), "value": (90, "e"), "threshold": (90, "e"),
-                  "logs": (95, "e"), "updated": (110, "e"), "errors": (240, "w"), "logerrs": (240, "w")}
+        layout = {"name": (175, "w"), "kind": (80, "w"), "value": (115, "e"), "threshold": (115, "e"),
+                  "logs": (115, "e"), "updated": (110, "e"), "errors": (240, "w"), "logerrs": (240, "w")}
         for col in DASHBOARD_COLUMNS:
             width, anchor = layout[col]
             self.tree.heading(col, text=headings[col], anchor=anchor)
@@ -1290,6 +1306,8 @@ class App(tk.Tk):
         legend_switch = ttk.Checkbutton(header, text="Legend", style="Switch.TCheckbutton",
                                         variable=self.legend_var, command=self._toggle_chart_legend)
         legend_switch.pack(side="right")
+        ttk.Label(header, text="Charts: New Relic APM only (CloudWatch logs aren't charted)",
+                  style="Muted.TLabel").pack(side="left")
         self._add_tooltip(legend_switch, "Hide the legend to give the charts more room. Hovering a chart "
                                          "still lists every service with its line style and values.")
 
@@ -2532,7 +2550,11 @@ class App(tk.Tk):
     def _on_tree_motion(self, event):
         iid = self.tree.identify_row(event.y)
         region = self.tree.identify_region(event.x, event.y)
-        key = (iid, self._column_id(self.tree.identify_column(event.x))) if iid and region in ("cell", "tree") else None
+        column = self._column_id(self.tree.identify_column(event.x))
+        if region == "heading":
+            key = ("heading", column) if column in HEADING_TOOLTIPS else None
+        else:
+            key = (iid, column) if iid and region in ("cell", "tree") else None
         self._update_tree_tooltip(key, event.x_root, event.y_root)
 
     def _column_id(self, column):
@@ -2556,18 +2578,21 @@ class App(tk.Tk):
         self.tooltip.hide()
 
     def _tree_tooltip_text(self, row, column):
+        if row == "heading":
+            return HEADING_TOOLTIPS[column]
         nr, logs = self._row_states(row)
         if nr is None:
             return None
         if column == "#0":
-            parts = [self._status_explanation(nr)]
+            parts = ["New Relic: " + (self._status_explanation(nr) or "-")]
             if logs is not None:
                 parts.append("CloudWatch logs: " + (self._status_explanation(logs) or "-"))
-            return "\n\n".join(p for p in parts if p)
+                parts.append(STATUS_SOURCES_NOTE)
+            return "\n\n".join(parts)
         if column in ("value", "threshold"):
-            return self._status_explanation(nr)
+            return "New Relic: " + (self._status_explanation(nr) or "-") + "\n\n" + NR_ONLY_NOTE
         if column == "logs" and logs is not None:
-            return self._status_explanation(logs)
+            return "CloudWatch logs: " + (self._status_explanation(logs) or "-") + "\n\n" + CW_ONLY_NOTE
         state = logs if column == "logerrs" else nr if column == "errors" else None
         if state is None or not state.records:
             return None

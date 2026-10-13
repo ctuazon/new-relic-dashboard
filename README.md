@@ -156,9 +156,11 @@ us-east-1) is the default; change it on the Settings tab.
 The table has one row per location (plus groups) with:
 
 - **Status**: the worse of New Relic and CloudWatch (`OK` / `Anomaly` /
-  `Error` / `Warning`). Hover it for both explanations.
-- **Error Rate / Threshold**: New Relic.
-- **Log Errors**: CloudWatch error lines in the count window against
+  `Error` / `Warning`). Hover it for both explanations. This is the only
+  place the two sources meet; their numbers are never combined.
+- **Error Rate (NR) / Threshold (NR)**: New Relic only — the % of APM
+  transactions that errored. CloudWatch log lines are not part of it.
+- **Log Errors (CW)**: CloudWatch only — error lines in the count window against
   their threshold, e.g. `12 / 100`. `⚠ error` means the logs couldn't be
   read (usually an expired AWS login); it doesn't turn the row red.
 - **Last Updated** (12-hour clock, e.g. `1:05:03 PM`; hidden when the
