@@ -3,6 +3,7 @@ boto3 client per profile, and AWS errors mapped to messages that say what to do.
 import os
 import shutil
 import subprocess
+import threading
 from typing import Iterable, List, Optional, Tuple
 
 try:
@@ -87,28 +88,41 @@ class AwsClient:
         self.region = region
         self._client = None
         self._session = None
+        self._lock = threading.Lock()
         self.needs_login = False
 
-    def _api(self):
+    def _session_and_client(self):
+        """The cached (session, client) pair, created if needed. Taken under the lock and handed
+        back as locals, so a reset() from another thread (e.g. AWS Login mid-poll) can't leave a
+        caller holding a half-cleared pair."""
         if not HAS_BOTO3:
             raise AwsError("boto3 is not installed. Run: pip install -r requirements.txt")
-        if self._client is None:
-            try:
-                self._session = boto3.Session(profile_name=self.profile or None, region_name=self.region)
-                self._client = self._session.client(self.service)
-            except BotoCoreError as e:  # e.g. the profile doesn't exist in ~/.aws/config
-                raise AwsError(str(e))
-        return self._client
+        with self._lock:
+            if self._client is None or self._session is None:
+                try:
+                    session = boto3.Session(profile_name=self.profile or None, region_name=self.region)
+                    client = session.client(self.service)
+                except BotoCoreError as e:  # e.g. the profile doesn't exist in ~/.aws/config
+                    raise AwsError(str(e))
+                self._session, self._client = session, client
+            return self._session, self._client
+
+    def _api(self):
+        return self._session_and_client()[1]
 
     def reset(self) -> None:
         """Drops the cached client so the next call loads credentials from a fresh login."""
-        self._client = None
-        self._session = None
+        with self._lock:
+            self._client = None
+            self._session = None
 
     def _other(self, service: str):
         """Another service's client on the same session/credentials (e.g. STS)."""
-        self._api()
-        return self._session.client(service)
+        session, _ = self._session_and_client()
+        try:
+            return session.client(service)
+        except BotoCoreError as e:
+            raise AwsError(str(e))
 
     def _login_error(self) -> AwsLoginError:
         self.reset()
