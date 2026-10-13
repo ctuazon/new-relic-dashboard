@@ -1142,6 +1142,7 @@ class App(tk.Tk):
                       highlightcolor=pal["border"])
         self.log_text.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
         self.change_detail.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
+        self.changes_empty.config(bg=pal["surface"], fg=pal["muted"])
         self.ct_targets_text.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
         self.chart_viewport.config(bg=pal["chart_bg"])
         self.details_text.config(bg=pal["surface"], fg=pal["fg"], selectbackground=pal["select"],
@@ -1419,6 +1420,9 @@ class App(tk.Tk):
         self.changes_tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.changes_tree.pack(side="left", fill="both", expand=True)
+        # Shown over the empty list (see _show_changes_placeholder) so it never just sits blank.
+        self.changes_empty = tk.Label(self.changes_tree, justify="center", wraplength=self._px(520),
+                                      bg=self.palette["surface"], fg=self.palette["muted"])
         paned.add(list_frame, weight=3)
 
         detail_frame = ttk.LabelFrame(paned, text="Details", padding=self._px(12))
@@ -1434,6 +1438,7 @@ class App(tk.Tk):
         paned.add(detail_frame, weight=2)
         self.changes_tree.bind("<<TreeviewSelect>>", self._show_change_detail)
         self.changes_tree.bind("<Double-1>", self._filter_to_row_pr)
+        self._show_changes_placeholder(self.monitor, [])
 
     def _filter_to_row_pr(self, event):
         """Double-click a PR row to see just that PR's history."""
@@ -1478,6 +1483,26 @@ class App(tk.Tk):
                 and (not prs or (e.pr_number and ("*" in prs or e.pr_number in prs)))
                 and self._app_filter_matches(e)]
 
+    def _show_changes_placeholder(self, monitor, changes):
+        """A message in the empty list: why it's empty, and that the first load takes a while."""
+        if changes:
+            self.changes_empty.place_forget()
+            return
+        if monitor.changes_error:
+            text = "CloudTrail couldn't be read — see the message above."
+        elif monitor.changes_checked_at is not None:
+            text = "No CloudTrail changes match the filters."
+        elif monitor.cloudtrail:
+            text = ("Loading CloudTrail changes… this can take a bit.\n\n"
+                    "Prod changes appear after about 25 seconds; the PR environments are busier "
+                    "and take about 2–3 minutes to fill in.")
+        else:
+            text = ("Start monitoring to load CloudTrail changes.\n\n"
+                    "The first load can take a bit: about 25 seconds for prod and 2–3 minutes "
+                    "for the PR environments.")
+        self.changes_empty.config(text=text)
+        self.changes_empty.place(relx=0.5, rely=0.5, anchor="center")
+
     def _render_changes(self):
         monitor = self.monitor
         if monitor.changes_error:
@@ -1500,6 +1525,7 @@ class App(tk.Tk):
         self.changes_status.config(text=status)
 
         changes = self._visible_changes()
+        self._show_changes_placeholder(monitor, changes)
         signature = (len(changes), changes[0].event_id if changes else None,
                      self.cfg.settings.cloudtrail_show_autoscaling, frozenset(self._pr_filter()),
                      self.app_filter_var.get().strip())
