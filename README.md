@@ -357,3 +357,8 @@ To only regenerate the icon file itself:
   Throughput (<1 rpm) are fixed defaults meant as reasonable "something's
   wrong" cutoffs; the Errors % chart reuses each location's own existing
   error-rate threshold instead of a separate fixed one.
+
+## Questions
+
+If you have any questions, feel free to contact Czyrus Tuazon at
+[czyrus.tuazon@traderinteractive.com](mailto:czyrus.tuazon@traderinteractive.com).
