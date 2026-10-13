@@ -5,63 +5,72 @@
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'AeroTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "AtvTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'AtvTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "Boatmart (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'Boatmart (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "CycleTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'CycleTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "EquipmentTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'EquipmentTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "PwcTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'PwcTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "RVTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'RVTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "SnowmobileTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'SnowmobileTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": null
     },
     {
       "name": "TruckTrader (ECS)",
       "nrql": "SELECT percentage(count(*), WHERE error IS true) AS 'errorRate' FROM Transaction WHERE appName = 'TruckTrader (ECS)' SINCE 5 minutes ago",
       "enabled": true,
       "use_custom_threshold": true,
-      "custom_threshold": 1.0
+      "custom_threshold": 1.0,
+      "log_host": "www.commercialtrucktrader.com"
     }
   ],
   "groups": [
@@ -83,6 +92,67 @@
     "alert_repeat_seconds": 8,
     "error_inbox_enabled": true,
     "error_inbox_lookback_seconds": 3600,
-    "error_inbox_container_attribute": "containerId"
+    "error_inbox_container_attribute": "containerId",
+    "min_transactions_for_alert": 20,
+    "mini_view_x": 837,
+    "mini_view_y": 1071,
+    "theme": "light",
+    "cloudwatch_enabled": true,
+    "cloudwatch_aws_profile": "xforce",
+    "cloudwatch_region": "us-east-1",
+    "cloudwatch_log_group": "marketplace-prod-logs",
+    "cloudwatch_filter_pattern": "?\"marketplace.ERROR\" ?\"marketplace.CRITICAL\" ?\"marketplace.ALERT\" ?\"marketplace.EMERGENCY\" ?\"PHP Fatal\"",
+    "cloudwatch_exclude_patterns": [],
+    "cloudwatch_lookback_seconds": 300,
+    "cloudwatch_poll_interval_seconds": 60,
+    "min_log_errors_for_alert": 10,
+    "cloudwatch_fallback_threshold": 100.0,
+    "cloudtrail_enabled": true,
+    "cloudtrail_targets": [
+      {
+        "label": "Marketplace",
+        "cluster": "marketplace-prod",
+        "service_prefix": "",
+        "profile": "xforce",
+        "region": "us-east-1",
+        "show_on_charts": true
+      },
+      {
+        "label": "SSR",
+        "cluster": "marketplace-ssr-prod",
+        "service_prefix": "",
+        "profile": "xforce",
+        "region": "us-east-1",
+        "show_on_charts": true
+      },
+      {
+        "label": "Search API",
+        "cluster": "marketplace-search-api-prod",
+        "service_prefix": "",
+        "profile": "xforce",
+        "region": "us-east-1",
+        "show_on_charts": true
+      },
+      {
+        "label": "SSR PRs",
+        "cluster": "marketplace-ssr-pr",
+        "service_prefix": "",
+        "profile": "MarketplaceDevs-toldev-729320268350",
+        "region": "us-east-1",
+        "show_on_charts": false
+      },
+      {
+        "label": "Search API PRs",
+        "cluster": "mp-sapi-pr-env-*",
+        "service_prefix": "",
+        "profile": "MarketplaceDevs-toldev-729320268350",
+        "region": "us-east-1",
+        "show_on_charts": false
+      }
+    ],
+    "cloudtrail_lookback_hours": 168,
+    "cloudtrail_poll_interval_seconds": 120,
+    "cloudtrail_show_autoscaling": false,
+    "chart_legend_visible": true
   }
 }

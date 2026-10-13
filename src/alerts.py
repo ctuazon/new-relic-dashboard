@@ -114,7 +114,10 @@ class AlertManager:
                     except Exception:
                         pass
                 if self.tts_enabled:
-                    self._tts.say(f"Anomaly detected in {alert.name}. Error rate {alert.value:.1f} percent.")
+                    if alert.key.startswith("cw:"):  # a CloudWatch logs series counts lines, not a rate
+                        self._tts.say(f"Log error spike in {alert.name}. {alert.value:.0f} error lines.")
+                    else:
+                        self._tts.say(f"Anomaly detected in {alert.name}. Error rate {alert.value:.1f} percent.")
                 time.sleep(0.4)
             self._stop.wait(self.repeat_seconds if unacknowledged else 1.0)
 

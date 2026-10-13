@@ -5,20 +5,22 @@ import threading
 import time
 import tkinter as tk
 import warnings
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 import matplotlib
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import same_color
-from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 
 from . import config, theme
 from .alerts import AlertManager
+from .aws import AwsLoginError, login_profiles, sso_login
 from .logger import SessionLogger
-from .monitor import MonitorEngine
+from .monitor import MonitorEngine, logs_key
 from .newrelic_client import NewRelicClient, OVERVIEW_METRICS
+from .pr_logs_client import PrLogsClient
 
 matplotlib.rcParams["font.family"] = [theme.FONT_FAMILY, "DejaVu Sans"]
 
@@ -26,14 +28,17 @@ POLL_UI_MS = 300
 CHART_LOOKBACK_MINUTES = 60
 CHART_DPI = 96  # so chart point sizes match Tk's (10.5pt = 14px at 100% scaling)
 CHART_FONT_PT = 10.5
-CHART_GRID_BREAKPOINT = 1100  # logical px: narrower than this, the 1x4 strip becomes a 2x2 grid
-CHART_MIN_2X2_HEIGHT = 380  # ...but only if there's enough height to stack two rows
+CHART_COLUMNS = 2  # the four overview charts sit in a fixed 2x2 grid
+CHART_MIN_ROW_HEIGHT = 130  # logical px per chart row; a shorter viewport scrolls instead of squashing
 DIM_ALPHA = 0.15
 METRIC_SHORT_LABELS = {"response_time": "Resp (s)", "apdex": "Apdex", "throughput": "rpm", "errors": "Err %"}
 METRIC_VALUE_FORMATS = {"response_time": "{:.3f}", "apdex": "{:.2f}", "throughput": "{:,.0f}", "errors": "{:.2f}"}
-TREE_MAX_ROWS = 10
+TREE_MAX_ROWS = 12
 TREE_NARROW_WIDTH = 1050  # logical px
-ERRORS_SUMMARY_CHARS = 48
+# Dashboard columns. A location's New Relic series ("loc:<name>") and its CloudWatch logs series
+# ("cw:<name>") share one row, keyed by the location's iid.
+DASHBOARD_COLUMNS = ("name", "kind", "value", "threshold", "logs", "updated", "errors", "logerrs")
+LOG_COLUMNS = ("logs", "logerrs")
 STATUS_LABELS = {"ok": "OK", "anomaly": "Anomaly", "error": "Error", "breach": "Warning", "pending": "Loading…"}
 CONN_TITLES = {"idle": "Not tested", "testing": "Checking…", "connected": "Connected", "failed": "Disconnected"}
 
@@ -45,9 +50,27 @@ CHART_THRESHOLDS = {
     "apdex": {"direction": "below", "default": 0.7},           # Apdex Fair/Poor boundary
     "throughput": {"direction": "below", "default": 1.0},      # rpm — near-zero traffic/outage
 }
+# CloudTrail change kinds drawn as markers on the charts (Auto Scaling resizes are left off).
+CHART_MARKER_KINDS = ("deploy", "create", "delete", "failed")
+CHANGE_KIND_LABELS = {"deploy": "Deploy", "scale": "Scale", "create": "Create", "delete": "Delete",
+                      "stop": "Stop task", "update": "Update", "failed": "Failed"}
+CLOUDTRAIL_TIMING_NOTE = (
+    "How fresh this is:\n"
+    "• After Start Monitoring, the first load reads the whole history window (a week by default). "
+    "Prod changes appear after about 25 seconds; the PR environments are busier and take about "
+    "2–3 minutes to fill in.\n"
+    "• After that it checks every 2 minutes (Settings → CloudTrail → Poll interval), "
+    "which takes a few seconds.\n"
+    "• CloudTrail itself can take up to about 15 minutes to report a change, so a deploy may "
+    "show up here a little after it happened.")
 LEGEND_PULSE_INTERVAL_MS = 150
 LEGEND_PULSE_AMPLITUDE = 3.5
 LEGEND_PULSE_PERIOD_S = 1.0
+# A new-records highlight blips green, holds, then fades back into the row; one over its threshold
+# stays red until opened.
+NEW_ERROR_HOLD_S = 10.0
+NEW_ERROR_FADE_S = 1.0
+NEW_ERROR_FADE_FRAME_MS = 50
 
 
 def format_12h_time(epoch_seconds: float) -> str:
@@ -57,6 +80,13 @@ def format_12h_time(epoch_seconds: float) -> str:
 
 def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def format_reading(kind: str, value) -> str:
+    """Error rates are percentages; a CloudWatch logs series is a count of error lines."""
+    if value is None:
+        return "-"
+    return f"{value:.0f} lines" if kind == "logs" else f"{value:.2f}%"
 
 
 class LocationDialog(tk.Toplevel):
@@ -87,16 +117,22 @@ class LocationDialog(tk.Toplevel):
         self.threshold_var = tk.StringVar(value=str(loc.custom_threshold))
         ttk.Entry(self, textvariable=self.threshold_var, width=10).grid(row=4, column=1, sticky="w", padx=8)
 
+        ttk.Label(self, text="CloudWatch log host:").grid(row=5, column=0, sticky="w", padx=8, pady=6)
+        self.log_host_var = tk.StringVar(value=loc.cloudwatch_host if loc.name else "")
+        ttk.Entry(self, textvariable=self.log_host_var, width=42).grid(row=5, column=1, padx=8, pady=6, sticky="w")
+
         ttk.Label(
             self,
             text=("Tip: the query must return one numeric column, e.g.\n"
                   "SELECT percentage(count(*), WHERE error IS true) FROM Transaction\n"
-                  "WHERE appName = 'X' SINCE 5 minutes ago"),
+                  "WHERE appName = 'X' SINCE 5 minutes ago\n"
+                  "Log host is the site's hostname in the CloudWatch logs; leave blank to use\n"
+                  "www.<name>.com (e.g. 'RVTrader (ECS)' -> www.rvtrader.com)."),
             foreground="gray", justify="left",
-        ).grid(row=5, column=0, columnspan=2, padx=8, pady=6, sticky="w")
+        ).grid(row=6, column=0, columnspan=2, padx=8, pady=6, sticky="w")
 
         btns = ttk.Frame(self)
-        btns.grid(row=6, column=0, columnspan=2, pady=10)
+        btns.grid(row=7, column=0, columnspan=2, pady=10)
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=6)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
         self.grab_set()
@@ -115,6 +151,10 @@ class LocationDialog(tk.Toplevel):
             name=name, nrql=nrql, enabled=self.enabled_var.get(),
             use_custom_threshold=self.custom_var.get(), custom_threshold=threshold,
         )
+        log_host = self.log_host_var.get().strip().lower()
+        # Only store an override; a host matching the name-derived default stays derived.
+        if log_host and log_host != self.result.cloudwatch_host:
+            self.result.log_host = log_host
         self.destroy()
 
 
@@ -185,10 +225,11 @@ class ErrorInboxDialog(tk.Toplevel):
 
     def __init__(self, parent, state):
         super().__init__(parent)
-        self.title(f"Error Inbox — {state.name}")
+        self.title(f"Error Inbox (New Relic) — {state.name}")
         scale = parent.ui_scale
         self.geometry(f"{int(1200 * scale)}x{int(600 * scale)}")
         self.records = state.error_records
+        self._source_header("New Relic", "TransactionError events from New Relic APM")
 
         # List on the left, full exception details in a side panel: long messages wrap there
         # instead of being clipped inside grid cells.
@@ -231,6 +272,13 @@ class ErrorInboxDialog(tk.Toplevel):
             self.list_tree.selection_set("0")
             self._show_detail()
 
+    def _source_header(self, source, detail):
+        """Names the data source at the top of the window, so the two inboxes aren't confused."""
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        ttk.Label(header, text=f"Source: {source}", style="Strong.TLabel").pack(side="left")
+        ttk.Label(header, text=f"  ·  {detail}", style="Muted.TLabel").pack(side="left")
+
     @staticmethod
     def _fmt_time(timestamp):
         if not timestamp:
@@ -262,7 +310,296 @@ class ErrorInboxDialog(tk.Toplevel):
         self.detail_text.config(state="disabled")
 
 
-MINI_FONT = (theme.FONT_FAMILY, 10)
+class LogInboxDialog(ErrorInboxDialog):
+    """The CloudWatch counterpart of the Error Inbox: every matching log line seen for a realm
+    this session, with the parsed fields and the full raw line in the detail panel."""
+
+    def __init__(self, parent, state):
+        tk.Toplevel.__init__(self, parent)
+        self.title(f"Log Inbox (CloudWatch) — {state.name}")
+        scale = parent.ui_scale
+        self.geometry(f"{int(1200 * scale)}x{int(600 * scale)}")
+        self.records = state.log_records
+        self._source_header("CloudWatch", "Error lines from CloudWatch Logs, log group "
+                                          f"{parent.cfg.settings.cloudwatch_log_group}")
+
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=12, pady=12)
+
+        list_frame = ttk.Frame(paned)
+        columns = ("time", "level", "message", "url", "task")
+        self.list_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=12)
+        headings = {"time": "Time", "level": "Level", "message": "Message", "url": "URL", "task": "Task"}
+        widths = {"time": 190, "level": 90, "message": 340, "url": 220, "task": 110}
+        for col in columns:
+            self.list_tree.heading(col, text=headings[col], anchor="w")
+            self.list_tree.column(col, width=int(widths[col] * scale), anchor="w")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.list_tree.yview)
+        self.list_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.list_tree.pack(side="left", fill="both", expand=True)
+        paned.add(list_frame, weight=3)
+
+        detail_frame = ttk.LabelFrame(paned, text="Details", padding=12)
+        self.detail_text = tk.Text(detail_frame, width=40, wrap="word", state="disabled",
+                                   borderwidth=0, highlightthickness=0, font="TkDefaultFont",
+                                   padx=4, pady=4, spacing1=2)
+        self.detail_text.pack(fill="both", expand=True)
+        paned.add(detail_frame, weight=2)
+
+        for i, rec in enumerate(self.records):
+            self.list_tree.insert("", "end", iid=str(i), values=(
+                self._fmt_time(rec.timestamp), rec.level, truncate(rec.message, 200),
+                rec.url or "-", rec.task_id[:12],
+            ))
+
+        self.list_tree.bind("<<TreeviewSelect>>", self._show_detail)
+        if self.records:
+            self.list_tree.selection_set("0")
+            self._show_detail()
+
+    def _show_detail(self, event=None):
+        sel = self.list_tree.selection()
+        if not sel:
+            return
+        rec = self.records[int(sel[0])]
+        fields = (
+            ("Time", self._fmt_time(rec.timestamp)),
+            ("Level", rec.level),
+            ("Message", rec.message),
+            ("Request", f"{rec.method} {rec.url}".strip() or "-"),
+            ("Host", rec.host or "-"),
+            ("ECS Task", rec.task_id or "-"),
+            ("Raw log line", rec.raw),
+        )
+        self.detail_text.config(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.tag_configure("field", font="SunValleyBodyStrongFont")
+        self.detail_text.tag_configure("value", spacing3=12)
+        for label, value in fields:
+            self.detail_text.insert("end", f"{label}\n", "field")
+            self.detail_text.insert("end", f"{value}\n", "value")
+        self.detail_text.config(state="disabled")
+
+
+PR_LOG_RANGES = (("Last 15 minutes", 15), ("Last hour", 60), ("Last 6 hours", 360),
+                 ("Last 24 hours", 1440), ("Last 7 days", 10080))
+PR_LOG_FOLLOW_MS = 5000
+PR_LOG_MAX_LINES = 20000  # follow mode drops the oldest lines past this
+PR_LOG_ERROR_WORDS = ("error", "fatal", "exception", "critical", "panic", "uncaught")
+ALL_CONTAINERS = "All containers"
+
+
+class PrLogsDialog(tk.Toplevel):
+    """A PR environment's container logs from CloudWatch: the whole window for a time range, or
+    followed live (the `tail -f` of the containers) with new lines appended every few seconds."""
+
+    def __init__(self, parent, change, target):
+        super().__init__(parent)
+        self.app = parent
+        self.title(f"PR Logs (CloudWatch) — {change.target} PR #{change.pr_number}")
+        scale = parent.ui_scale
+        self.geometry(f"{int(1200 * scale)}x{int(680 * scale)}")
+        pal = parent.palette
+        self.configure(bg=pal["bg"])
+        self.client = PrLogsClient(target.profile, target.region)
+        self.cluster, self.service = change.cluster, change.service
+        self.containers = []  # ContainerLog per container, once looked up
+        self._result = None  # (status, payload) handed from the worker thread to the Tk thread
+        self._busy = False
+        self._refresh_pending = False  # a refresh asked for mid-load runs once that load is done
+        self._follow_job = None
+        self._last_ts = None  # newest line shown; follow mode fetches only what's after it
+
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+        ttk.Label(header, text="Source: CloudWatch", style="Strong.TLabel").pack(side="left")
+        ttk.Label(header, text=f"  ·  container logs of {self.service} in cluster {self.cluster} "
+                               f"(profile {target.profile})", style="Muted.TLabel").pack(side="left")
+
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", padx=12, pady=(10, 0))
+        ttk.Label(controls, text="Container").pack(side="left", padx=(0, 6))
+        self.container_var = tk.StringVar(value=ALL_CONTAINERS)
+        self.container_combo = ttk.Combobox(controls, textvariable=self.container_var, state="readonly",
+                                            width=22, values=[ALL_CONTAINERS])
+        self.container_combo.pack(side="left")
+        self.container_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Label(controls, text="Range").pack(side="left", padx=(16, 6))
+        self.range_var = tk.StringVar(value=PR_LOG_RANGES[1][0])
+        range_combo = ttk.Combobox(controls, textvariable=self.range_var, state="readonly", width=15,
+                                   values=[label for label, _m in PR_LOG_RANGES])
+        range_combo.pack(side="left")
+        range_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Label(controls, text="Filter").pack(side="left", padx=(16, 6))
+        self.filter_var = tk.StringVar()
+        filter_entry = ttk.Entry(controls, textvariable=self.filter_var, width=24)
+        filter_entry.pack(side="left")
+        filter_entry.bind("<Return>", lambda e: self.refresh())
+        parent._add_tooltip(filter_entry, "A CloudWatch filter pattern, applied when you press Enter. Plain "
+                                          "words match lines containing all of them (case-sensitive), e.g. "
+                                          "ERROR; ?ERROR ?Fatal matches either.")
+        self.follow_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Follow", style="Switch.TCheckbutton", variable=self.follow_var,
+                        command=self._toggle_follow).pack(side="right")
+        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="right", padx=(0, 12))
+
+        self.status = ttk.Label(self, style="Muted.TLabel", text="Looking up the containers' log locations…")
+        self.status.pack(fill="x", padx=12, pady=(8, 0))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=12, pady=12)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.text = tk.Text(body, wrap="none", state="disabled", font="TkFixedFont", borderwidth=0,
+                            highlightthickness=0, padx=6, pady=4, bg=pal["surface"], fg=pal["fg"],
+                            insertbackground=pal["fg"])
+        yscroll = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        xscroll = ttk.Scrollbar(body, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.text.tag_configure("time", foreground=pal["muted"])
+        self.text.tag_configure("container", foreground=pal["caution"])
+        self.text.tag_configure("error", foreground=pal["danger"])
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._run(lambda: self.client.container_logs(self.cluster, self.service), self._on_containers)
+
+    # ---------- background work ----------
+    def _run(self, work, on_done):
+        """Runs `work` off the Tk thread and hands its result to `on_done` on the Tk thread."""
+        self._busy = True
+
+        def worker():
+            try:
+                self._result = ("ok", work())
+            except Exception as e:  # AwsError carries a readable message; anything else is shown as-is
+                self._result = ("error", e)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll(on_done)
+
+    def _poll(self, on_done):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._result is None:
+            self.after(100, self._poll, on_done)
+            return
+        status, payload = self._result
+        self._result, self._busy = None, False
+        if status == "error":
+            hint = " Click AWS Login in the main window, then Refresh." if isinstance(payload, AwsLoginError) else ""
+            self.status.config(text=f"Couldn't load the logs: {payload}{hint}")
+        else:
+            on_done(payload)
+        if self._refresh_pending and not self._busy:
+            self.refresh()
+
+    # ---------- loading ----------
+    def _on_containers(self, containers):
+        self.containers = containers
+        self.container_combo.configure(values=[ALL_CONTAINERS] + [c.container for c in containers])
+        self.refresh()
+
+    def _selected_containers(self):
+        name = self.container_var.get()
+        return [c for c in self.containers if name in (ALL_CONTAINERS, c.container)]
+
+    def _range_minutes(self):
+        return next(m for label, m in PR_LOG_RANGES if label == self.range_var.get())
+
+    def refresh(self):
+        if self._busy:
+            self._refresh_pending = True
+            return
+        self._refresh_pending = False
+        if not self.containers:  # the lookup failed earlier; try it again
+            self.status.config(text="Looking up the containers' log locations…")
+            self._run(lambda: self.client.container_logs(self.cluster, self.service), self._on_containers)
+            return
+        containers, pattern = self._selected_containers(), self.filter_var.get().strip()
+        since = time.time() - self._range_minutes() * 60
+        self.status.config(text="Loading…")
+        self._run(lambda: self.client.get_lines(containers, since, pattern), self._show_lines)
+
+    def _show_lines(self, result):
+        lines, truncated = result
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.config(state="disabled")
+        self._last_ts = None
+        self._append(lines)
+        self.text.see("end")
+        where = self.container_var.get().lower()
+        note = " (cut short: narrow the range or add a filter to see everything)" if truncated else ""
+        self.status.config(text=f"{len(lines)} line{'s' if len(lines) != 1 else ''} from {where}, "
+                                f"{self.range_var.get().lower()}{note} · loaded {format_12h_time(time.time())}")
+        self._schedule_follow()
+
+    def _append(self, lines):
+        if not lines:
+            return
+        at_bottom = self.text.yview()[1] >= 0.999
+        many = len(self._selected_containers()) > 1
+        width = max((len(c.container) for c in self.containers), default=0)
+        self.text.config(state="normal")
+        for line in lines:
+            stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(line.timestamp))
+            self.text.insert("end", stamp + "  ", "time")
+            if many:
+                self.text.insert("end", line.container.ljust(width) + "  ", "container")
+            lowered = line.message.lower()
+            tag = "error" if any(w in lowered for w in PR_LOG_ERROR_WORDS) else ()
+            self.text.insert("end", line.message + "\n", tag)
+        excess = int(self.text.index("end-1c").split(".")[0]) - PR_LOG_MAX_LINES
+        if excess > 0:
+            self.text.delete("1.0", f"{excess + 1}.0")
+        self.text.config(state="disabled")
+        self._last_ts = lines[-1].timestamp
+        if at_bottom:
+            self.text.see("end")
+
+    # ---------- follow (tail -f) ----------
+    def _toggle_follow(self):
+        self._schedule_follow()
+
+    def _schedule_follow(self):
+        if self._follow_job is not None:
+            self.after_cancel(self._follow_job)
+            self._follow_job = None
+        if self.follow_var.get():
+            self._follow_job = self.after(PR_LOG_FOLLOW_MS, self._follow_tick)
+
+    def _follow_tick(self):
+        self._follow_job = None
+        if self._busy or not self.containers:
+            self._schedule_follow()
+            return
+        # CloudWatch times are whole milliseconds, so start 1 ms after the newest line shown.
+        since = (self._last_ts + 0.001) if self._last_ts else time.time() - PR_LOG_FOLLOW_MS / 1000
+        containers, pattern = self._selected_containers(), self.filter_var.get().strip()
+
+        def done(result):
+            lines, _truncated = result
+            self._append(lines)
+            self.status.config(text=f"Following: {len(lines)} new line{'s' if len(lines) != 1 else ''} · "
+                                    f"checked {format_12h_time(time.time())}")
+            self._schedule_follow()
+
+        self._run(lambda: self.client.get_lines(containers, since, pattern), done)
+
+    def _close(self):
+        if self._follow_job is not None:
+            self.after_cancel(self._follow_job)
+        self.destroy()
+
+
+MINI_FONT =(theme.FONT_FAMILY, 10)
 MINI_FONT_BOLD = (theme.FONT_FAMILY_STRONG, 10)
 MINI_ICON_SIZE = 13
 MINI_REFRESH_MS = 500
@@ -389,7 +726,9 @@ class MiniView(tk.Toplevel):
         else:
             self.silence_btn.pack_forget()
 
-        states = list(app.monitor.states.values())
+        # A logs series only takes up room on the strip while it's alerting; 19 items won't fit.
+        states = [s for s in list(app.monitor.states.values())
+                  if s.kind != "logs" or s.status == "ANOMALY"]
         keys = [s.key for s in states]
         if list(self._items.keys()) != keys:
             for frame, *_ in self._items.values():
@@ -437,7 +776,8 @@ class MiniView(tk.Toplevel):
     def _make_item(self, state):
         frame = tk.Frame(self.items_frame, cursor="hand2")
         frame.pack(side="left", padx=(4, 12))
-        name_label = tk.Label(frame, text=short_name(state.name), fg=self.app.palette["mini_fg"], font=MINI_FONT)
+        label = short_name(state.name) + (" logs" if state.kind == "logs" else "")
+        name_label = tk.Label(frame, text=label, fg=self.app.palette["mini_fg"], font=MINI_FONT)
         name_label.pack(side="left")
         status_label = tk.Label(frame, text="", font=MINI_FONT)
         status_label.pack(side="left", padx=(4, 0))
@@ -472,7 +812,8 @@ class MiniView(tk.Toplevel):
         app = self.app
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Restore full view", command=app.show_full_view)
-        for text, tab in (("Dashboard", app.dashboard_tab), ("Locations & Groups", app.locations_tab),
+        for text, tab in (("Dashboard", app.dashboard_tab), ("CloudTrail", app.changes_tab),
+                          ("Locations & Groups", app.locations_tab),
                           ("Settings", app.settings_tab), ("Logs", app.logs_tab)):
             menu.add_command(label=f"Open {text}", command=lambda t=tab: app.show_full_view(tab=t))
         menu.add_separator()
@@ -522,6 +863,8 @@ class App(tk.Tk):
         self._new_error_iids = set()
         self._prev_newest_error_guid = {}
         self._error_cell_overlays = {}
+        self._new_error_at = {}  # key -> when its highlight started (or last stood over its threshold)
+        self._overlay_tick_id = None
         self._row_separators = {}
         self._last_metrics = None
         self._legend_names = []
@@ -529,10 +872,15 @@ class App(tk.Tk):
         self._chart_values = {}
         self._crosshairs = {}
         self._crosshair_idx = None
-        self._chart_cols = len(OVERVIEW_METRICS)
         self._chart_relayout_job = None
+        self._legend_px = 0  # measured height of the chart legend, reserved above the charts
         self._tree_hover_key = None
         self._tree_narrow = False
+        self._changes_signature = None
+        self._changes_shown = []
+        self._avg_char_px = None
+        self._details_row = None  # dashboard row whose details panel is open
+        self._details_text_cache = None
 
         self.alert_manager = AlertManager(
             on_change=lambda: self.event_queue.put(("alerts_changed", None)),
@@ -582,6 +930,8 @@ class App(tk.Tk):
         self._icons = {}  # icons bake in palette colors; regenerated lazily below
         self._style_non_ttk_widgets()
         self._apply_tree_tags()
+        self._changes_signature = None  # re-render so the row colors follow the theme
+        self._render_changes()
         for iid in list(self._error_cell_overlays):
             self._remove_error_overlay(iid)
         for sep in self._row_separators.values():
@@ -604,6 +954,11 @@ class App(tk.Tk):
                       selectforeground=pal["fg"], highlightbackground=pal["border"],
                       highlightcolor=pal["border"])
         self.log_text.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
+        self.change_detail.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
+        self.ct_targets_text.config(bg=pal["surface"], fg=pal["fg"], insertbackground=pal["fg"])
+        self.chart_viewport.config(bg=pal["chart_bg"])
+        self.details_text.config(bg=pal["surface"], fg=pal["fg"], selectbackground=pal["select"],
+                                 selectforeground=pal["fg"])
 
     # ---------- UI construction ----------
     def _build_ui(self):
@@ -619,8 +974,14 @@ class App(tk.Tk):
         ttk.Separator(bar, orient="vertical").pack(side="right", fill="y", padx=self._px(6))
         ttk.Button(bar, text="Silence All", command=self.alert_manager.acknowledge_all).pack(
             side="right", padx=self._px(4))
+        clear_new_btn = ttk.Button(bar, text="Clear All New", command=self._clear_new_errors)
+        clear_new_btn.pack(side="right", padx=self._px(4))
+        self._add_tooltip(clear_new_btn, "Marks every container's new errors as seen, removing the "
+                                         "green highlights without opening each inbox.")
         ttk.Separator(bar, orient="vertical").pack(side="right", fill="y", padx=self._px(6))
         ttk.Button(bar, text="Test Connection", command=self._test_connection).pack(side="right", padx=self._px(4))
+        self.aws_login_btn = ttk.Button(bar, text="AWS Login", command=self._aws_login)
+        self.aws_login_btn.pack(side="right", padx=self._px(4))
         self.refresh_btn = ttk.Button(bar, text="Refresh Now", command=self._refresh_now)
         self.refresh_btn.pack(side="right", padx=self._px(4))
         self.start_btn = ttk.Button(bar, text="Start Monitoring", style="Accent.TButton",
@@ -650,16 +1011,19 @@ class App(tk.Tk):
 
         pad = self._px(12)
         self.dashboard_tab = ttk.Frame(self.notebook, padding=pad)
+        self.changes_tab = ttk.Frame(self.notebook, padding=pad)
         self.locations_tab = ttk.Frame(self.notebook, padding=pad)
         self.settings_tab = ttk.Frame(self.notebook, padding=pad)
         self.logs_tab = ttk.Frame(self.notebook, padding=pad)
 
         self.notebook.add(self.dashboard_tab, text="Dashboard")
+        self.notebook.add(self.changes_tab, text="CloudTrail")
         self.notebook.add(self.locations_tab, text="Locations & Groups")
         self.notebook.add(self.settings_tab, text="Settings")
         self.notebook.add(self.logs_tab, text="Logs")
 
         self._build_dashboard_tab()
+        self._build_changes_tab()
         self._build_locations_tab()
         self._build_settings_tab()
         self._build_logs_tab()
@@ -667,24 +1031,26 @@ class App(tk.Tk):
 
     def _build_dashboard_tab(self):
         frame = self.dashboard_tab
-        columns = ("name", "kind", "value", "threshold", "updated", "errors")
         # The tree column (#0) holds the status badge: a shape-coded icon plus a text label.
-        self.tree = ttk.Treeview(frame, columns=columns, show="tree headings", height=1)
+        self.tree = ttk.Treeview(frame, columns=DASHBOARD_COLUMNS, show="tree headings", height=1)
         self.tree.heading("#0", text="Status", anchor="w")
-        self.tree.column("#0", width=self._px(150), minwidth=self._px(120), anchor="w", stretch=False)
+        self.tree.column("#0", width=self._px(140), minwidth=self._px(120), anchor="w", stretch=False)
         headings = {
-            "name": "Name", "kind": "Type", "value": "Error Rate %", "threshold": "Threshold %",
-            "updated": "Last Updated", "errors": "Error Inbox",
+            "name": "Name", "kind": "Type", "value": "Error Rate", "threshold": "Threshold",
+            "logs": "Log Errors", "updated": "Last Updated", "errors": "Error Inbox (New Relic)",
+            "logerrs": "Log Inbox (CloudWatch)",
         }
         # Text left-aligned, numbers right-aligned so values line up for vertical scanning.
-        layout = {"name": (220, "w"), "kind": (95, "w"), "value": (125, "e"), "threshold": (125, "e"),
-                  "updated": (135, "e"), "errors": (300, "w")}
-        for col in columns:
+        layout = {"name": (175, "w"), "kind": (80, "w"), "value": (90, "e"), "threshold": (90, "e"),
+                  "logs": (95, "e"), "updated": (110, "e"), "errors": (240, "w"), "logerrs": (240, "w")}
+        for col in DASHBOARD_COLUMNS:
             width, anchor = layout[col]
             self.tree.heading(col, text=headings[col], anchor=anchor)
-            # Only the Error Inbox column flexes, so names and numbers keep their width.
-            self.tree.column(col, width=self._px(width), minwidth=self._px(width if col != "errors" else 140),
-                             anchor=anchor, stretch=col == "errors")
+            # Only the two inbox summaries flex, so names and numbers keep their width.
+            flex = col in ("errors", "logerrs")
+            self.tree.column(col, width=self._px(width), minwidth=self._px(140 if flex else width),
+                             anchor=anchor, stretch=flex)
+        self._apply_display_columns()
         self.tree.pack(fill="x", expand=False, pady=(0, self._px(12)))
         self._apply_tree_tags()
 
@@ -693,21 +1059,49 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self._on_dashboard_right_click)
         # Column widths are recomputed after <Configure>/column drags, so resync once idle.
         self.tree.bind("<Configure>", self._on_tree_configure)
-        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._sync_error_overlays), add="+")
+        self.tree.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._on_columns_changed), add="+")
         self.tree.bind("<MouseWheel>", lambda e: self.after_idle(self._sync_error_overlays), add="+")
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda e: self._hide_tree_tooltip())
 
-        self._build_charts_panel(frame)
+        # Details (when a row is selected) sits to the left of the charts.
+        lower = ttk.Frame(frame)
+        lower.pack(fill="both", expand=True)
+        self.charts_column = ttk.Frame(lower)
+        self.charts_column.pack(side="left", fill="both", expand=True)
+        self._build_details_panel(lower)
+        self.details_frame.pack(side="left", fill="both", padx=(0, self._px(12)), before=self.charts_column)
+        self._build_charts_panel(self.charts_column)
+        self._clear_details()
+
+    def _apply_display_columns(self):
+        """Type (location/group) is obvious from the names, so it stays hidden to give the two
+        inbox summaries room; when narrow, Last Updated goes too. Without CloudWatch tracking,
+        the two log columns are dropped."""
+        hidden = {"kind"}
+        if self._tree_narrow:
+            hidden.add("updated")
+        if not self.cfg.settings.cloudwatch_enabled:
+            hidden.update(LOG_COLUMNS)
+        self.tree.configure(displaycolumns=[c for c in DASHBOARD_COLUMNS if c not in hidden])
 
     def _on_tree_configure(self, event):
-        # When narrow, drop the low-value Type column so the Error Inbox summary keeps its room.
         narrow = event.width < self._px(TREE_NARROW_WIDTH)
         if narrow != self._tree_narrow:
             self._tree_narrow = narrow
-            columns = self.tree["columns"]
-            self.tree.configure(displaycolumns=[c for c in columns if c != "kind"] if narrow else columns)
-        self.after_idle(self._sync_error_overlays)
+            self._apply_display_columns()
+        self.after_idle(self._on_columns_changed)
+
+    def _on_columns_changed(self):
+        # Summaries are cut to fit their column, so a resize re-renders them at the new width.
+        self._render_dashboard()
+
+    def _cell_chars(self, column):
+        """How many characters of a summary fit in the column at its current width."""
+        if self._avg_char_px is None:
+            self._avg_char_px = max(1.0, tkfont.nametofont("TkDefaultFont").measure("abcdefghij klmnopqrst") / 21)
+        width = self.tree.column(column, "width") - self._px(16)
+        return max(20, int(width / self._avg_char_px))
 
     def _apply_tree_tags(self):
         pal = self.palette
@@ -719,23 +1113,43 @@ class App(tk.Tk):
         self.tree.tag_configure("breach", background=pal["row_breach"])
 
     def _build_charts_panel(self, parent):
+        header = ttk.Frame(parent)
+        header.pack(fill="x", pady=(0, self._px(4)))
+        self.legend_var = tk.BooleanVar(value=self.cfg.settings.chart_legend_visible)
+        legend_switch = ttk.Checkbutton(header, text="Legend", style="Switch.TCheckbutton",
+                                        variable=self.legend_var, command=self._toggle_chart_legend)
+        legend_switch.pack(side="right")
+        self._add_tooltip(legend_switch, "Hide the legend to give the charts more room. Hovering a chart "
+                                         "still lists every service with its line style and values.")
+
         charts_frame = ttk.Frame(parent)
         charts_frame.pack(fill="both", expand=True)
+        # The figure sits in a scrollable viewport: it fills the viewport when there's room, and
+        # keeps a readable minimum height per chart row (scrolling) when there isn't.
+        self.chart_viewport = tk.Canvas(charts_frame, highlightthickness=0, bd=0,
+                                        yscrollincrement=self._px(40))
+        self.chart_viewport.pack(fill="both", expand=True)
+        # Placed over the right edge rather than packed beside it, so showing it doesn't change
+        # the width the column count is chosen from (which could flip the layout back and forth).
+        self.chart_scrollbar = ttk.Scrollbar(charts_frame, orient="vertical", command=self.chart_viewport.yview)
+        self.chart_viewport.configure(yscrollcommand=self.chart_scrollbar.set)
+        self.chart_viewport.bind("<Configure>", lambda e: self._sync_chart_viewport())
 
         self.chart_fig = Figure(figsize=(11, 4), dpi=CHART_DPI)
         self.chart_fig.set_facecolor(self.palette["chart_bg"])
         self.chart_axes = {}
         for i, (key, title, _select) in enumerate(OVERVIEW_METRICS):
-            ax = self.chart_fig.add_subplot(1, len(OVERVIEW_METRICS), i + 1)
+            ax = self.chart_fig.add_subplot(math.ceil(len(OVERVIEW_METRICS) / CHART_COLUMNS), CHART_COLUMNS, i + 1)
             self._style_axis(ax, title)
             self.chart_axes[key] = ax
         self._axis_keys = {ax: key for key, ax in self.chart_axes.items()}
 
-        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=charts_frame)
+        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, master=self.chart_viewport)
         widget = self.chart_canvas.get_tk_widget()
         widget.configure(highlightthickness=0, bd=0)
-        widget.pack(fill="both", expand=True)
+        self._chart_window = self.chart_viewport.create_window(0, 0, window=widget, anchor="nw")
         widget.bind("<Configure>", self._on_chart_resize, add="+")
+        widget.bind("<MouseWheel>", self._on_chart_wheel, add="+")
         self.chart_canvas.mpl_connect("pick_event", self._on_legend_pick)
         self.chart_canvas.mpl_connect("button_press_event", self._on_chart_click)
         self.chart_canvas.mpl_connect("motion_notify_event", self._on_chart_motion)
@@ -753,6 +1167,227 @@ class App(tk.Tk):
             spine.set_color(pal["chart_grid"])
         ax.grid(axis="y", color=pal["chart_grid"], linewidth=0.8)
         ax.set_axisbelow(True)
+
+    def _build_changes_tab(self):
+        """CloudTrail feed of deploys and other ECS changes on the configured clusters, newest
+        first. Display only: none of these raise alerts."""
+        frame = self.changes_tab
+        top = ttk.Frame(frame)
+        top.pack(fill="x", pady=(0, self._px(10)))
+        self.changes_status = ttk.Label(top, text="Start monitoring to load CloudTrail changes.",
+                                        style="Muted.TLabel")
+        self.changes_status.pack(side="left")
+        self._info_icon(top, CLOUDTRAIL_TIMING_NOTE).pack(side="left", padx=(self._px(8), 0))
+        self._add_tooltip(self.changes_status, CLOUDTRAIL_TIMING_NOTE)
+
+        # Packed right-to-left: Show Auto Scaling, then the PR filter, then the App filter.
+        pr_box = ttk.Frame(top)
+        app_box = ttk.Frame(top)
+        self.app_filter_var = tk.StringVar()
+        self.app_filter_var.trace_add("write", lambda *_: self._render_changes())
+        self.pr_filter_var = tk.StringVar()
+        self.pr_filter_var.trace_add("write", lambda *_: self._render_changes())
+        self.show_scaling_var = tk.BooleanVar(value=self.cfg.settings.cloudtrail_show_autoscaling)
+        scaling_switch = ttk.Checkbutton(top, text="Show Auto Scaling", style="Switch.TCheckbutton",
+                                         variable=self.show_scaling_var, command=self._toggle_show_scaling)
+        scaling_switch.pack(side="right")
+        self._add_tooltip(scaling_switch, "Auto Scaling changes the number of running tasks hundreds of "
+                                          "times a week, so those rows are hidden unless this is on. "
+                                          "Deploys, creates, deletes and task stops are always shown.")
+        pr_box.pack(side="right", padx=(0, self._px(20)))
+        ttk.Label(pr_box, text="PR #").pack(side="left", padx=(0, self._px(6)))
+        pr_entry = ttk.Entry(pr_box, textvariable=self.pr_filter_var, width=14)
+        pr_entry.pack(side="left")
+        ttk.Button(pr_box, text="Clear", command=lambda: self.pr_filter_var.set("")).pack(
+            side="left", padx=(self._px(6), 0))
+        self._add_tooltip(pr_entry, "Show only these PRs' environments: when each started, every deploy, "
+                                    "and when it was torn down. Separate several with commas (3384, 3381). "
+                                    "Type \"pr\" for all PR environments. PR numbers are per repo, so the "
+                                    "App column says whether it's an SSR or Search API PR.")
+        app_box.pack(side="right", padx=(0, self._px(20)))
+        ttk.Label(app_box, text="App").pack(side="left", padx=(0, self._px(6)))
+        app_combo = ttk.Combobox(app_box, textvariable=self.app_filter_var, width=16,
+                                 postcommand=lambda: app_combo.configure(values=self._change_app_names()))
+        app_combo.pack(side="left")
+        ttk.Button(app_box, text="Clear", command=lambda: self.app_filter_var.set("")).pack(
+            side="left", padx=(self._px(6), 0))
+        self._add_tooltip(app_combo, "Show only one app's changes: pick it from the list, or type part of a "
+                                     "name (\"ssr\" matches both SSR and SSR PRs, or part of a service name). "
+                                     "Combines with the PR filter.")
+
+        paned = ttk.PanedWindow(frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+        list_frame = ttk.Frame(paned)
+        columns = ("time", "target", "pr", "service", "change", "actor")
+        self.changes_tree = ttk.Treeview(list_frame, columns=columns, show="headings")
+        headings = {"time": "Time", "target": "App", "pr": "PR", "service": "Service", "change": "Change",
+                    "actor": "By"}
+        widths = {"time": 170, "target": 110, "pr": 70, "service": 210, "change": 270, "actor": 220}
+        for col in columns:
+            self.changes_tree.heading(col, text=headings[col], anchor="w")
+            self.changes_tree.column(col, width=self._px(widths[col]), anchor="w", stretch=col == "change")
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.changes_tree.yview)
+        self.changes_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.changes_tree.pack(side="left", fill="both", expand=True)
+        paned.add(list_frame, weight=3)
+
+        detail_frame = ttk.LabelFrame(paned, text="Details", padding=self._px(12))
+        self.pr_logs_btn = ttk.Button(detail_frame, text="View PR Container Logs (CloudWatch)",
+                                      command=self._open_pr_logs, state="disabled")
+        self.pr_logs_btn.pack(anchor="w", pady=(0, self._px(8)))
+        self._add_tooltip(self.pr_logs_btn, "Opens the selected PR environment's container logs (SSR or "
+                                            "Search API PRs on ECS), with a Follow switch to watch new lines "
+                                            "as they arrive, like tail -f.")
+        self.change_detail = tk.Text(detail_frame, width=40, wrap="word", state="disabled", borderwidth=0,
+                                     highlightthickness=0, font="TkDefaultFont", padx=4, pady=4, spacing1=2)
+        self.change_detail.pack(fill="both", expand=True)
+        paned.add(detail_frame, weight=2)
+        self.changes_tree.bind("<<TreeviewSelect>>", self._show_change_detail)
+        self.changes_tree.bind("<Double-1>", self._filter_to_row_pr)
+
+    def _filter_to_row_pr(self, event):
+        """Double-click a PR row to see just that PR's history."""
+        iid = self.changes_tree.identify_row(event.y)
+        if iid and self._changes_shown[int(iid)].pr_number:
+            self.pr_filter_var.set(self._changes_shown[int(iid)].pr_number)
+
+    def _toggle_show_scaling(self):
+        self.cfg.settings.cloudtrail_show_autoscaling = self.show_scaling_var.get()
+        self.cfg.save()
+        self._render_changes()
+
+    def _pr_filter(self):
+        """The PR numbers typed in the filter box; {"*"} for "pr" (every PR environment)."""
+        text = self.pr_filter_var.get().strip().lower()
+        if text in ("pr", "prs", "all prs"):
+            return {"*"}
+        return {part.strip().lstrip("#").removeprefix("pr").strip() for part in text.split(",")} - {""}
+
+    def _change_app_names(self):
+        """Apps for the App filter's list: the configured targets, plus any seen in the feed."""
+        names = [t.label for t in self.cfg.settings.cloudtrail_targets]
+        names += sorted({e.target for e in list(self.monitor.changes) if e.target} - set(names))
+        return names
+
+    def _app_filter_matches(self, event):
+        """A name picked from the list matches exactly (so "SSR" leaves out "SSR PRs"); anything
+        typed matches as a case-insensitive substring of the app or the service."""
+        text = self.app_filter_var.get().strip()
+        if not text:
+            return True
+        if text in self._change_app_names():
+            return event.target == text
+        text = text.lower()
+        return text in event.target.lower() or text in (event.service or "").lower()
+
+    def _visible_changes(self):
+        show_scaling = self.cfg.settings.cloudtrail_show_autoscaling
+        prs = self._pr_filter()
+        return [e for e in list(self.monitor.changes)
+                if (show_scaling or not e.is_autoscaling)
+                and (not prs or (e.pr_number and ("*" in prs or e.pr_number in prs)))
+                and self._app_filter_matches(e)]
+
+    def _render_changes(self):
+        monitor = self.monitor
+        if monitor.changes_error:
+            status = f"CloudTrail: {monitor.changes_error}"
+        elif monitor.changes_checked_at is None:
+            status = ("Loading CloudTrail changes…" if monitor.cloudtrail
+                      else "Start monitoring to load CloudTrail changes.")
+        else:
+            changes = self._visible_changes()
+            deploys = sum(1 for e in changes if e.kind == "deploy")
+            prs = self._pr_filter()
+            scope = ("" if not prs else " for all PRs" if "*" in prs
+                     else f" for PR {', '.join('#' + n for n in sorted(prs))}")
+            app = self.app_filter_var.get().strip()
+            if app:
+                scope += f" in {app}"
+            status = (f"{len(changes)} change{'s' if len(changes) != 1 else ''} ({deploys} deploys){scope} in the "
+                      f"last {self.cfg.settings.cloudtrail_lookback_hours} h · checked "
+                      f"{format_12h_time(monitor.changes_checked_at)}")
+        self.changes_status.config(text=status)
+
+        changes = self._visible_changes()
+        signature = (len(changes), changes[0].event_id if changes else None,
+                     self.cfg.settings.cloudtrail_show_autoscaling, frozenset(self._pr_filter()),
+                     self.app_filter_var.get().strip())
+        if signature == self._changes_signature:
+            return
+        self._changes_signature = signature
+        selected = self.changes_tree.selection()
+        selected_id = self._changes_shown[int(selected[0])].event_id if selected else None
+        self._changes_shown = changes
+        self.changes_tree.delete(*self.changes_tree.get_children())
+        pal = self.palette
+        self.changes_tree.tag_configure("failed", foreground=pal["danger"])
+        self.changes_tree.tag_configure("scale", foreground=pal["muted"])
+        self.changes_tree.tag_configure("deploy", font="SunValleyBodyStrongFont")
+        for i, e in enumerate(changes):
+            self.changes_tree.insert("", "end", iid=str(i), tags=(e.kind,), values=(
+                ErrorInboxDialog._fmt_time(e.timestamp), e.target, f"#{e.pr_number}" if e.pr_number else "",
+                e.service or "-", e.summary, e.actor))
+            if e.event_id == selected_id:
+                self.changes_tree.selection_set(str(i))
+
+    def _show_change_detail(self, event=None):
+        sel = self.changes_tree.selection()
+        if not sel:
+            return
+        e = self._changes_shown[int(sel[0])]
+        self.pr_logs_btn.config(state="normal" if self._pr_logs_target(e) else "disabled")
+        fields = (
+            ("Time", ErrorInboxDialog._fmt_time(e.timestamp)),
+            ("Change", f"{CHANGE_KIND_LABELS.get(e.kind, e.kind)}: {e.summary}"),
+            ("Cluster / service", f"{e.cluster} / {e.service or '-'}"),
+            ("PR", f"#{e.pr_number} ({e.target})" if e.pr_number else "- (not a PR environment)"),
+            ("By", e.actor),
+            ("Role", e.role or "-"),
+            ("CloudTrail event", e.raw),
+        )
+        text = self.change_detail
+        text.config(state="normal")
+        text.delete("1.0", "end")
+        text.tag_configure("field", font="SunValleyBodyStrongFont")
+        text.tag_configure("value", spacing3=12)
+        text.tag_configure("code", font="TkFixedFont")
+        for label, value in fields:
+            text.insert("end", f"{label}\n", "field")
+            text.insert("end", f"{value}\n", "code" if label == "CloudTrail event" else "value")
+        text.config(state="disabled")
+
+    def _pr_logs_target(self, change):
+        """The CloudTrail target a PR row came from (for its AWS profile), or None if the row
+        isn't a PR environment's service."""
+        if not (change.pr_number and change.service and change.cluster):
+            return None
+        return next((t for t in self.cfg.settings.cloudtrail_targets if t.label == change.target), None)
+
+    def _open_pr_logs(self):
+        sel = self.changes_tree.selection()
+        if not sel:
+            return
+        change = self._changes_shown[int(sel[0])]
+        target = self._pr_logs_target(change)
+        if target:
+            PrLogsDialog(self, change, target)
+
+    def _chart_changes(self):
+        """Deploy-type changes inside the charts' time window, as (x position, event)."""
+        timeline = self._chart_timeline
+        if len(timeline) < 2:
+            return []
+        markers = []
+        for e in list(self.monitor.changes):
+            if (not e.on_charts or e.kind not in CHART_MARKER_KINDS
+                    or not timeline[0] <= e.timestamp <= timeline[-1]):
+                continue
+            i = max(j for j, t in enumerate(timeline) if t <= e.timestamp)
+            nxt = timeline[i + 1] if i + 1 < len(timeline) else timeline[i] + 60
+            markers.append((i + (e.timestamp - timeline[i]) / (nxt - timeline[i]), e))
+        return markers
 
     def _build_locations_tab(self):
         frame = self.locations_tab
@@ -782,8 +1417,17 @@ class App(tk.Tk):
         self._refresh_loc_lists()
 
     def _build_settings_tab(self):
-        frame = ttk.Frame(self.settings_tab, padding=self._px(8))
-        frame.pack(fill="both", expand=True)
+        # Sub-tabs keep each group of settings narrow enough for the default window; one Save
+        # button below them saves all three.
+        save_row = ttk.Frame(self.settings_tab)
+        save_row.pack(side="bottom", fill="x", pady=(self._px(12), 0))
+        ttk.Button(save_row, text="Save Settings", style="Accent.TButton", command=self._save_settings).pack(side="left")
+        ttk.Label(save_row, text="Saves the General, CloudWatch Logs and CloudTrail tabs together.",
+                  style="Muted.TLabel").pack(side="left", padx=(self._px(12), 0))
+        sections = ttk.Notebook(self.settings_tab)
+        sections.pack(fill="both", expand=True)
+        frame = ttk.Frame(sections, padding=self._px(12))
+        sections.add(frame, text="General")
         s = self.cfg.settings
         pady = self._px(6)
 
@@ -833,8 +1477,65 @@ class App(tk.Tk):
                                f"(set NEW_RELIC_ACCOUNT_ID in .env, restart to apply)",
                   style="Muted.TLabel").grid(row=12, column=0, columnspan=2, sticky="w", pady=(self._px(4), 0))
 
-        ttk.Button(frame, text="Save Settings", style="Accent.TButton", command=self._save_settings).grid(
-            row=13, column=0, pady=self._px(20), sticky="w")
+        cw = ttk.Frame(sections, padding=self._px(12))
+        sections.add(cw, text="CloudWatch Logs")
+
+        def cw_row(r, label, var, width=10):
+            ttk.Label(cw, text=label).grid(row=r, column=0, sticky="w", pady=pady, padx=(0, self._px(16)))
+            ttk.Entry(cw, textvariable=var, width=width).grid(row=r, column=1, sticky="w", pady=pady)
+
+        self.cw_enabled_var = tk.BooleanVar(value=s.cloudwatch_enabled)
+        ttk.Checkbutton(cw, text="Track CloudWatch error logs per realm (applies on next Start)",
+                        variable=self.cw_enabled_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=pady)
+        self.cw_profile_var = tk.StringVar(value=s.cloudwatch_aws_profile)
+        cw_row(1, "AWS profile:", self.cw_profile_var, width=24)
+        self.cw_region_var = tk.StringVar(value=s.cloudwatch_region)
+        cw_row(2, "AWS region:", self.cw_region_var, width=24)
+        self.cw_group_var = tk.StringVar(value=s.cloudwatch_log_group)
+        cw_row(3, "Log group:", self.cw_group_var, width=32)
+        self.cw_filter_var = tk.StringVar(value=s.cloudwatch_filter_pattern)
+        cw_row(4, "Filter pattern:", self.cw_filter_var, width=48)
+        self.cw_exclude_var = tk.StringVar(value="; ".join(s.cloudwatch_exclude_patterns))
+        cw_row(5, "Ignore lines containing (separate with ;):", self.cw_exclude_var, width=48)
+        self.cw_lookback_var = tk.StringVar(value=str(s.cloudwatch_lookback_seconds))
+        cw_row(6, "Count window (seconds):", self.cw_lookback_var)
+        self.cw_poll_var = tk.StringVar(value=str(s.cloudwatch_poll_interval_seconds))
+        cw_row(7, "Poll interval (seconds):", self.cw_poll_var)
+        self.cw_min_var = tk.StringVar(value=str(s.min_log_errors_for_alert))
+        cw_row(8, "Min error lines in window before alerting:", self.cw_min_var)
+        self.cw_fallback_var = tk.StringVar(value=str(s.cloudwatch_fallback_threshold))
+        cw_row(9, "Fallback threshold (lines) before min samples:", self.cw_fallback_var)
+        ttk.Label(cw, text="If logs show a login error, click AWS Login at the top\n"
+                           "(runs aws sso login for the profile above).",
+                  style="Muted.TLabel", justify="left").grid(row=10, column=0, columnspan=2, sticky="w",
+                                                            pady=(self._px(12), 0))
+
+        ct = ttk.Frame(sections, padding=self._px(12))
+        sections.add(ct, text="CloudTrail")
+        self.ct_enabled_var = tk.BooleanVar(value=s.cloudtrail_enabled)
+        ct_header = ttk.Frame(ct)
+        ct_header.grid(row=0, column=0, columnspan=2, sticky="w", pady=pady)
+        ttk.Checkbutton(ct_header, text="Show ECS deploys/changes from CloudTrail (applies on next Start)",
+                        variable=self.ct_enabled_var).pack(side="left")
+        self._info_icon(ct_header, CLOUDTRAIL_TIMING_NOTE).pack(side="left", padx=(self._px(8), 0))
+        self.ct_lookback_var = tk.StringVar(value=str(s.cloudtrail_lookback_hours))
+        ttk.Label(ct, text="History to show (hours):").grid(row=1, column=0, sticky="w", pady=pady)
+        ttk.Entry(ct, textvariable=self.ct_lookback_var, width=10).grid(row=1, column=1, sticky="w", pady=pady)
+        self.ct_poll_var = tk.StringVar(value=str(s.cloudtrail_poll_interval_seconds))
+        ttk.Label(ct, text="Poll interval (seconds):").grid(row=2, column=0, sticky="w", pady=pady)
+        ttk.Entry(ct, textvariable=self.ct_poll_var, width=10).grid(row=2, column=1, sticky="w", pady=pady)
+        ttk.Label(ct, text="Clusters to watch, one per line:\n"
+                           "label | cluster | service prefix | profile | region | charts\n"
+                           "End a cluster with * for per-PR clusters (e.g. mp-sapi-pr-env-*). "
+                           "charts = yes/no: mark its deploys on the dashboard charts.",
+                  style="Muted.TLabel", justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(pady, 0))
+        self.ct_targets_text = tk.Text(ct, width=110, height=6, font="TkFixedFont", borderwidth=1, relief="solid",
+                                       wrap="none")
+        self.ct_targets_text.insert("1.0", "\n".join(
+            f"{t.label} | {t.cluster} | {t.service_prefix} | {t.profile} | {t.region} | "
+            f"{'yes' if t.show_on_charts else 'no'}" for t in s.cloudtrail_targets))
+        self.ct_targets_text.grid(row=4, column=0, columnspan=2, sticky="w", pady=pady)
+
 
     def _build_logs_tab(self):
         frame = self.logs_tab
@@ -845,10 +1546,32 @@ class App(tk.Tk):
             side="left", padx=(self._px(16), 0))
         ttk.Button(top, text="Refresh", command=self._refresh_logs).pack(side="right")
 
-        self.log_text = tk.Text(frame, height=28, state="disabled", wrap="none", font="TkFixedFont",
+        # No wrapping (one entry per line keeps it scannable), so long lines get a horizontal scrollbar.
+        body = ttk.Frame(frame)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(body, height=28, state="disabled", wrap="none", font="TkFixedFont",
                                 borderwidth=0, highlightthickness=0, padx=self._px(10), pady=self._px(8))
-        self.log_text.pack(fill="both", expand=True)
+        yscroll = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
+        xscroll = ttk.Scrollbar(body, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
         self._refresh_logs()
+
+    def _add_tooltip(self, widget, text):
+        """Hover help for a widget, using the app's themed tooltip."""
+        widget.bind("<Enter>", lambda e: self.tooltip.show_text(e.x_root, e.y_root, text), add="+")
+        widget.bind("<Motion>", lambda e: self.tooltip.move(e.x_root, e.y_root), add="+")
+        widget.bind("<Leave>", lambda e: self.tooltip.hide(), add="+")
+
+    def _info_icon(self, parent, text):
+        """A small ⓘ that shows the note on hover."""
+        icon = ttk.Label(parent, text="ⓘ", style="Muted.TLabel", cursor="question_arrow")
+        self._add_tooltip(icon, text)
+        return icon
 
     # ---------- connection status ----------
     def _set_connection(self, state, message):
@@ -868,8 +1591,38 @@ class App(tk.Tk):
         self._set_connection("testing", "Testing connection…")
 
         def worker():
-            ok, message = self.client.test_connection()
-            self.event_queue.put(("conn_result", (ok, message)))
+            ok, message, needs_login = self._check_connections()
+            self.event_queue.put(("conn_result", (ok, message, needs_login)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _check_connections(self):
+        """New Relic decides pass/fail; a CloudWatch problem (usually an expired AWS login) is
+        reported alongside it but doesn't stop the New Relic monitoring from starting. The third
+        value says whether AWS needs logging in to."""
+        ok, message = self.client.test_connection()
+        needs_login = False
+        for aws_client in self.monitor.aws_clients():
+            _aws_ok, aws_message = aws_client.test_connection()
+            message = f"{message} · {aws_message}"
+            needs_login = needs_login or aws_client.needs_login
+        return ok, message, needs_login
+
+    def _aws_login(self):
+        """One-click `aws sso login`: the browser opens to approve it, then the connection is
+        rechecked and CloudWatch reads the logs straight away instead of at its next poll."""
+        s = self.cfg.settings
+        profiles = ([s.cloudwatch_aws_profile] if s.cloudwatch_enabled else []) + \
+            ([t.profile for t in s.cloudtrail_targets] if s.cloudtrail_enabled else [])
+        self.aws_login_btn.config(state="disabled", text="Approve in browser…")
+
+        def worker():
+            # One login per SSO session; profiles that share one are covered together.
+            results = [sso_login(profile) for profile in login_profiles(profiles or [s.cloudwatch_aws_profile])]
+            failed = [message for ok, message in results if not ok]
+            ok = not failed
+            message = "; ".join(failed) if failed else "; ".join(message for _ok, message in results)
+            self.event_queue.put(("aws_login_result", (ok, message)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -891,8 +1644,8 @@ class App(tk.Tk):
         self._set_connection("testing", "Checking connection…")
 
         def worker():
-            ok, message = self.client.test_connection()
-            self.event_queue.put(("start_conn_result", (ok, message)))
+            ok, message, needs_login = self._check_connections()
+            self.event_queue.put(("start_conn_result", (ok, message, needs_login)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -911,16 +1664,11 @@ class App(tk.Tk):
     def _seed_loading_rows(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
-        for loc in self.cfg.locations:
-            if not loc.enabled:
-                continue
-            self.tree.insert("", "end", iid=f"loc:{loc.name}", text=" " + STATUS_LABELS["pending"],
-                             image=self.icon("pending"), values=(loc.name, "location", "-", "-", "-", "-"),
-                             tags=("pending",))
-        for grp in self.cfg.groups:
-            self.tree.insert("", "end", iid=f"grp:{grp.name}", text=" " + STATUS_LABELS["pending"],
-                             image=self.icon("pending"), values=(grp.name, "group", "-", "-", "-", "-"),
-                             tags=("pending",))
+        rows = [(f"loc:{loc.name}", loc.name, "location") for loc in self.cfg.locations if loc.enabled]
+        rows += [(f"grp:{grp.name}", grp.name, "group") for grp in self.cfg.groups]
+        for iid, name, kind in rows:
+            self.tree.insert("", "end", iid=iid, text=" " + STATUS_LABELS["pending"], image=self.icon("pending"),
+                             values=(name, kind) + ("-",) * (len(DASHBOARD_COLUMNS) - 2), tags=("pending",))
         self._fit_tree_height()
 
     def _start_loading_feedback(self):
@@ -1017,6 +1765,12 @@ class App(tk.Tk):
             s.alert_repeat_seconds = max(2, int(self.repeat_var.get()))
             s.min_transactions_for_alert = max(0, int(self.minvol_var.get()))
             s.error_inbox_lookback_seconds = max(5, int(self.errbox_lookback_var.get()))
+            s.cloudwatch_lookback_seconds = max(60, int(self.cw_lookback_var.get()))
+            s.cloudwatch_poll_interval_seconds = max(15, int(self.cw_poll_var.get()))
+            s.min_log_errors_for_alert = max(0, int(self.cw_min_var.get()))
+            s.cloudwatch_fallback_threshold = float(self.cw_fallback_var.get())
+            s.cloudtrail_lookback_hours = max(1, min(24 * 90, int(self.ct_lookback_var.get())))  # CloudTrail keeps 90 days
+            s.cloudtrail_poll_interval_seconds = max(30, int(self.ct_poll_var.get()))
         except ValueError:
             messagebox.showerror("Invalid input", "Please enter valid numbers.")
             return
@@ -1024,18 +1778,50 @@ class App(tk.Tk):
         s.tts_enabled = self.tts_var.get()
         s.error_inbox_enabled = self.errbox_var.get()
         s.error_inbox_container_attribute = self.errbox_attr_var.get().strip() or "containerId"
+        s.cloudwatch_enabled = self.cw_enabled_var.get()
+        self._apply_display_columns()
+        s.cloudwatch_aws_profile = self.cw_profile_var.get().strip()
+        s.cloudwatch_region = self.cw_region_var.get().strip() or "us-east-1"
+        s.cloudwatch_log_group = self.cw_group_var.get().strip()
+        s.cloudwatch_filter_pattern = self.cw_filter_var.get().strip() or config.DEFAULT_CLOUDWATCH_FILTER
+        s.cloudwatch_exclude_patterns = [x.strip() for x in self.cw_exclude_var.get().split(";") if x.strip()]
+        s.cloudtrail_enabled = self.ct_enabled_var.get()
+        targets = []
+        for line in self.ct_targets_text.get("1.0", "end").splitlines():
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) < 2 or not parts[1]:
+                continue
+            parts += [""] * (6 - len(parts))
+            targets.append(config.ChangeTarget(label=parts[0] or parts[1], cluster=parts[1], service_prefix=parts[2],
+                                               profile=parts[3] or "xforce", region=parts[4] or "us-east-1",
+                                               show_on_charts=parts[5].lower() not in ("no", "n", "false")))
+        s.cloudtrail_targets = targets
         self.alert_manager.sound_enabled = s.sound_enabled
         self.alert_manager.tts_enabled = s.tts_enabled
         self.alert_manager.repeat_seconds = s.alert_repeat_seconds
         self.cfg.save()
         messagebox.showinfo("Saved", "Settings saved.")
 
+    def _offer_aws_login(self, needs_login):
+        if needs_login and str(self.aws_login_btn.cget("state")) != "disabled" and messagebox.askyesno(
+                "AWS login expired",
+                "Your AWS login has expired, so CloudWatch logs can't be read.\n\n"
+                "Log in now? Your browser will open to approve it."):
+            self._aws_login()
+
     def _refresh_logs(self):
+        # see("end") would also scroll sideways to the end of the last (often very long) line,
+        # leaving shorter lines looking blank. Instead keep the reader's horizontal position, and
+        # only follow new entries if they were already at the bottom.
+        at_bottom = self.log_text.yview()[1] >= 0.999
+        top, left = self.log_text.yview()[0], self.log_text.xview()[0]
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.insert("end", "\n".join(self.session_logger.tail()))
-        self.log_text.see("end")
         self.log_text.config(state="disabled")
+        # Once laid out: scroll positions set before Tk has measured the new text don't stick.
+        self.after_idle(lambda: (self.log_text.yview_moveto(1.0 if at_bottom else top),
+                                 self.log_text.xview_moveto(left)))
 
     # ---------- queue draining / rendering ----------
     def _drain_queue(self):
@@ -1043,23 +1829,35 @@ class App(tk.Tk):
             while True:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "conn_result":
-                    ok, message = payload
+                    ok, message, needs_login = payload
                     self._set_connection("connected" if ok else "failed", message)
-                elif kind == "start_conn_result":
+                    self._offer_aws_login(needs_login)
+                elif kind == "aws_login_result":
                     ok, message = payload
+                    self.aws_login_btn.config(state="normal", text="AWS Login")
+                    self.session_logger.event("INFO" if ok else "ERROR", message)
+                    if ok:
+                        self.monitor.reset_aws_clients()
+                        if self.monitor.is_running():
+                            self.monitor.refresh_now()
+                        self._test_connection()
+                    else:
+                        messagebox.showerror("AWS login", message)
+                elif kind == "start_conn_result":
+                    ok, message, needs_login = payload
                     self._set_connection("connected" if ok else "failed", message)
                     self.refresh_btn.config(state="normal")
                     if ok:
                         self.monitor.start()
-                        self._new_error_iids.clear()
-                        for iid in list(self._error_cell_overlays.keys()):
-                            self._remove_error_overlay(iid)
+                        self._offer_aws_login(needs_login)
+                        self._clear_new_errors()
                         self.start_btn.config(text="Stop Monitoring", style="TButton", state="normal")
                         self._start_loading_feedback()
                     else:
                         self.start_btn.config(state="normal")
                         messagebox.showerror("Connection failed", f"Can't start monitoring:\n{message}")
                 elif kind == "update":
+                    self._render_changes()
                     self._render_dashboard()
                     self._refresh_logs()
                     self._refresh_charts()
@@ -1129,6 +1927,7 @@ class App(tk.Tk):
         self._avg_annotations = {}  # ax.clear() below discards the old annotation artists too
         self._crosshairs = {}
         self._crosshair_idx = None
+        markers = self._chart_changes()
         self.chart_fig.set_facecolor(pal["chart_bg"])
         for key, title, _select in OVERVIEW_METRICS:
             ax = self.chart_axes[key]
@@ -1145,6 +1944,8 @@ class App(tk.Tk):
                 self._chart_lines[(key, app_name)] = line
             if timeline:
                 ax.set_xlim(0, max(len(timeline) - 1, 1))
+            for x, _event in markers:  # deploys, so a spike can be lined up with what changed
+                ax.axvline(x, color=pal["caution"], linewidth=1.2, linestyle=(0, (1, 2)), zorder=1)
             self._crosshairs[key] = ax.axvline(0, color=pal["muted"], linewidth=1, linestyle=(0, (4, 3)),
                                                visible=False, zorder=5)
 
@@ -1168,35 +1969,61 @@ class App(tk.Tk):
         self._apply_highlight()  # the legend was rebuilt for the new width
         self.chart_canvas.draw_idle()
 
+    def _sync_chart_viewport(self):
+        """Sizes the figure to the viewport's width, and to its height unless that would squash the
+        rows below the minimum, in which case the figure grows taller and the viewport scrolls."""
+        viewport = self.chart_viewport
+        width, height = viewport.winfo_width(), viewport.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+        rows = math.ceil(len(OVERVIEW_METRICS) / CHART_COLUMNS)
+        fig_height = max(height, self._legend_px + rows * self._px(CHART_MIN_ROW_HEIGHT))
+        viewport.itemconfigure(self._chart_window, width=width, height=fig_height)
+        viewport.configure(scrollregion=(0, 0, width, fig_height))
+        if fig_height > height:
+            self.chart_scrollbar.place(relx=1, rely=0, relheight=1, anchor="ne")
+            self.chart_scrollbar.lift()
+        else:
+            self.chart_scrollbar.place_forget()
+            viewport.yview_moveto(0)
+
+    def _on_chart_wheel(self, event):
+        if self.chart_scrollbar.winfo_ismapped():
+            self._hide_crosshair()  # the tooltip would otherwise describe the point scrolled away from
+            self.chart_viewport.yview_scroll(int(-event.delta / 120), "units")
+
+    def _toggle_chart_legend(self):
+        self.cfg.settings.chart_legend_visible = self.legend_var.get()
+        self.cfg.save()
+        self._on_chart_resize_settled()
+
     def _layout_charts(self):
-        """1x4 strip when there's room, 2x2 grid when the window gets narrow; legend re-wrapped to
-        the width, with exactly its height reserved above the charts."""
+        """Legend re-wrapped to the width, with exactly its height reserved above the 2x2 charts."""
         widget = self.chart_canvas.get_tk_widget()
         width, height = widget.winfo_width(), widget.winfo_height()
         if width <= 1 or height <= 1:
             return
-        count = len(OVERVIEW_METRICS)
-        narrow = width < self._px(CHART_GRID_BREAKPOINT) and height >= self._px(CHART_MIN_2X2_HEIGHT)
-        cols = 2 if narrow else count
-        if cols != self._chart_cols:
-            grid = GridSpec(math.ceil(count / cols), cols, figure=self.chart_fig)
-            for i, ax in enumerate(self.chart_axes.values()):
-                ax.set_subplotspec(grid[i // cols, i % cols])
-            self._chart_cols = cols
+        legend_px = self._legend_px
         top = self._build_legend(width)
+        if self._legend_px != legend_px:
+            # The legend's height feeds into the figure's minimum height; resizing the figure
+            # brings us back here through <Configure>.
+            self.after_idle(self._sync_chart_viewport)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # tight_layout complains when the window is tiny
             self.chart_fig.tight_layout(rect=(0, 0, 1, top), h_pad=1.6, w_pad=2.2)
 
     def _build_legend(self, width):
-        """(Re)creates the clickable legend and returns the figure fraction left for the charts."""
+        """(Re)creates the clickable legend, records its height and returns the figure fraction
+        left for the charts."""
         for old_legend in list(self.chart_fig.legends):
             old_legend.remove()
         self._legend_app_by_artist = {}
         self._legend_texts = {}
         self._legend_handles = {}
+        self._legend_px = 0
         names = self._legend_names
-        if not names:
+        if not names or not self.legend_var.get():
             return 0.98
         pal = self.palette
         font_px = self.chart_font * self.ui_scale * 96 / 72
@@ -1215,14 +2042,14 @@ class App(tk.Tk):
             self._legend_handles[app_name] = handle
             self._legend_texts[app_name] = text_artist
         renderer = self.chart_canvas.get_renderer()
-        legend_height = legend.get_window_extent(renderer).height + self._px(8)
-        return max(0.5, 1 - legend_height / self.chart_fig.bbox.height)
+        self._legend_px = int(math.ceil(legend.get_window_extent(renderer).height)) + self._px(8)
+        return max(0.5, 1 - self._legend_px / self.chart_fig.bbox.height)
 
     def _set_xticks(self):
         timeline = self._chart_timeline
         if not timeline:
             return
-        per_chart = self.chart_canvas.get_tk_widget().winfo_width() / self._chart_cols
+        per_chart = self.chart_canvas.get_tk_widget().winfo_width() / CHART_COLUMNS
         count = max(2, min(6, int(per_chart // self._px(95))))
         n = len(timeline)
         step = max(1, math.ceil((n - 1) / (count - 1))) if n > 1 else 1
@@ -1362,6 +2189,15 @@ class App(tk.Tk):
                 else:
                     cell(METRIC_VALUE_FORMATS[key].format(value), row, col, fg=fg, font=font)
 
+        # Deploys within a minute of the hovered point, from the CloudTrail feed.
+        nearby = [e for x, e in self._chart_changes() if abs(x - idx) <= 1]
+        for offset, e in enumerate(nearby[:6]):
+            row = len(self._legend_names) + 2 + offset
+            tk.Label(body, text=f"◆ {format_12h_time(e.timestamp)}  {e.target} {e.service}: {e.summary} "
+                                f"({e.actor})", bg=bg, fg=pal["caution"], font="TkDefaultFont").grid(
+                row=row, column=0, columnspan=len(OVERVIEW_METRICS) + 2, sticky="w",
+                pady=(self._px(8) if offset == 0 else 1, 1))
+
     # ---------- thresholds ----------
     def _threshold_for(self, metric_key, app_name):
         if metric_key == "errors":
@@ -1412,54 +2248,107 @@ class App(tk.Tk):
         self.after(LEGEND_PULSE_INTERVAL_MS, self._animate_legend)
 
     # ---------- dashboard grid ----------
+    @staticmethod
+    def _row_for(key):
+        """The dashboard row a series is shown on: a logs series shares its location's row."""
+        return "loc:" + key[len("cw:"):] if key.startswith("cw:") else key
+
+    @staticmethod
+    def _cell_for(key):
+        """The inbox column a series' records are summarised in."""
+        return "logerrs" if key.startswith("cw:") else "errors"
+
+    def _row_states(self, row):
+        """(New Relic state, CloudWatch logs state) for a dashboard row; either may be None."""
+        states = self.monitor.states
+        logs = states.get(logs_key(row[len("loc:"):])) if row.startswith("loc:") else None
+        return states.get(row), logs
+
+    def _inbox_summary(self, state, column):
+        if state is None or not state.records:
+            return "-"
+        count = len(state.records)
+        if state.kind == "logs":
+            latest = state.log_records[0]
+            text = f"{count} line{'s' if count != 1 else ''} · {latest.level}: {latest.message}"
+        else:
+            latest = state.error_records[0]
+            text = f"{count} error{'s' if count != 1 else ''} · {latest.error_class}: {latest.error_message}"
+        # Cut to the column's width; the full text is on hover and in the details panel.
+        return truncate(" ".join(text.split()), self._cell_chars(column))
+
+    @staticmethod
+    def _logs_cell(logs):
+        if logs is None:
+            return "-"
+        if logs.status == "ERROR":
+            return "⚠ error"
+        if logs.value is None:
+            return "…"
+        mark = "▲ " if logs.status == "ANOMALY" else ""
+        return f"{mark}{logs.value:.0f} / {logs.threshold:.0f}"
+
+    def _track_new_records(self, state):
+        """Flags a series whose newest record changed since the last render. The first poll of a
+        session just establishes the baseline (whatever's already in the lookback window); only a
+        different newest id after that counts as "new". Comparing ids rather than counts keeps
+        working once a record list hits its cap and stops growing."""
+        newest = state.newest_record_id
+        if newest and newest != self._prev_newest_error_guid.get(state.key) and not self._awaiting_first_update:
+            self._new_error_iids.add(state.key)
+            self._new_error_at[state.key] = time.monotonic()
+        self._prev_newest_error_guid[state.key] = newest
+
     def _render_dashboard(self):
         existing = set(self.tree.get_children())
         seen = set()
-        for state in self.monitor.states.values():
-            iid = state.key
-            seen.add(iid)
-            value = f"{state.value:.2f}" if state.value is not None else "-"
-            threshold = f"{state.threshold:.2f}" if state.threshold is not None else "-"
-            updated = format_12h_time(state.last_updated) if state.last_updated else "-"
-            breached = self._breached_metrics(state)
-            if state.status == "OK" and breached:
+        for state in list(self.monitor.states.values()):
+            if state.kind == "logs":
+                continue  # shown in its location's row
+            row = state.key
+            seen.add(row)
+            nr, logs = self._row_states(row)
+            breached = self._breached_metrics(nr)
+            # The badge is the worse of the two sources; a CloudWatch read failure (e.g. an expired
+            # AWS login) only marks the Log Errors cell, so it can't paint every row as broken.
+            if nr.status == "ANOMALY" or (logs is not None and logs.status == "ANOMALY"):
+                badge = "anomaly"
+            elif nr.status == "ERROR":
+                badge = "error"
+            elif nr.status == "OK" and breached:
                 badge = "breach"
             else:
-                badge = {"OK": "ok", "ANOMALY": "anomaly", "ERROR": "error"}.get(state.status, "pending")
-            tag = "breach" if breached else badge
-            if state.error_records:
-                latest = state.error_records[0]
-                count = len(state.error_records)
-                summary = " ".join(f"{latest.error_class}: {latest.error_message}".split())
-                # Short summary only; the full exception shows on hover and in the Error Inbox.
-                errors = truncate(f"{count} error{'s' if count != 1 else ''} · {summary}", ERRORS_SUMMARY_CHARS)
-            else:
-                errors = "-"
-            newest_guid = state.error_records[0].guid if state.error_records else None
-            # The first poll of a session just establishes the baseline (whatever's already
-            # sitting in the lookback window) -- only a different newest guid after that counts
-            # as "new". Comparing guids rather than counts keeps working once the per-location
-            # record list hits its cap and stops growing.
-            if (newest_guid and newest_guid != self._prev_newest_error_guid.get(iid)
-                    and not self._awaiting_first_update):
-                self._new_error_iids.add(iid)
-            self._prev_newest_error_guid[iid] = newest_guid
-            values = (state.name, state.kind, value, threshold, updated, errors)
+                badge = {"OK": "ok"}.get(nr.status, "pending")
+            tag = "breach" if breached and badge != "anomaly" else badge
+            for series in (nr, logs):
+                if series is not None:
+                    self._track_new_records(series)
+            updated_at = max((x.last_updated for x in (nr, logs) if x is not None and x.last_updated), default=None)
+            values = (
+                nr.name, nr.kind,
+                format_reading(nr.kind, nr.value), format_reading(nr.kind, nr.threshold),
+                self._logs_cell(logs),
+                format_12h_time(updated_at) if updated_at else "-",
+                self._inbox_summary(nr, "errors"), self._inbox_summary(logs, "logerrs"),
+            )
             item = dict(text=" " + STATUS_LABELS[badge], image=self.icon(badge), values=values, tags=(tag,))
-            if iid in existing:
-                self.tree.item(iid, **item)
+            if row in existing:
+                self.tree.item(row, **item)
             else:
-                self.tree.insert("", "end", iid=iid, **item)
-        for iid in existing - seen:
-            self.tree.delete(iid)
-            self._new_error_iids.discard(iid)
-            self._prev_newest_error_guid.pop(iid, None)
-            self._remove_error_overlay(iid)
+                self.tree.insert("", "end", iid=row, **item)
+        for row in existing - seen:
+            self.tree.delete(row)
+            for key in (row, logs_key(row[len("loc:"):]) if row.startswith("loc:") else None):
+                if key:
+                    self._new_error_iids.discard(key)
+                    self._prev_newest_error_guid.pop(key, None)
+                    self._remove_error_overlay(key)
         self._fit_tree_height()
         self._sync_error_overlays()
+        self._render_details()
 
     def _breached_metrics(self, state):
-        if state.kind != "location":
+        if state is None or state.kind != "location":
             return set()
         app_name = next((l.app_name for l in self.cfg.locations if l.name == state.name), None)
         return self._breaching_apps.get(app_name) or set()
@@ -1472,8 +2361,12 @@ class App(tk.Tk):
     def _on_tree_motion(self, event):
         iid = self.tree.identify_row(event.y)
         region = self.tree.identify_region(event.x, event.y)
-        key = (iid, self.tree.identify_column(event.x)) if iid and region in ("cell", "tree") else None
+        key = (iid, self._column_id(self.tree.identify_column(event.x))) if iid and region in ("cell", "tree") else None
         self._update_tree_tooltip(key, event.x_root, event.y_root)
+
+    def _column_id(self, column):
+        # identify_column() numbers *displayed* columns ("#3"), which shift when some are hidden.
+        return column if column == "#0" else self.tree.column(column, "id")
 
     def _update_tree_tooltip(self, key, x_root, y_root):
         if key == self._tree_hover_key:
@@ -1491,47 +2384,165 @@ class App(tk.Tk):
         self._tree_hover_key = None
         self.tooltip.hide()
 
-    def _tree_tooltip_text(self, iid, column):
-        state = self.monitor.states.get(iid)
-        if state is None:
+    def _tree_tooltip_text(self, row, column):
+        nr, logs = self._row_states(row)
+        if nr is None:
             return None
         if column == "#0":
-            return self._status_explanation(state)
-        # identify_column() numbers *displayed* columns, which shift when Type is hidden.
-        if column == "overlay" or self.tree.column(column, "id") == "errors":
-            column = "errors"
-        if column == "errors" and state.error_records:
-            rec = state.error_records[0]
-            count = len(state.error_records)
-            status = rec.status_code if rec.status_code is not None else "-"
-            endpoint = f"{rec.method or ''} {rec.endpoint}".strip()
-            return (f"{count} error{'s' if count != 1 else ''} captured. Latest:\n\n"
-                    f"{rec.error_class}\n{rec.error_message}\n\n"
-                    f"Endpoint: {endpoint}\n"
-                    f"HTTP status: {status}\nContainer: {rec.container}\n"
-                    f"Time: {ErrorInboxDialog._fmt_time(rec.timestamp)}\n\n"
-                    f"Double-click to open the Error Inbox.")
-        return None
+            parts = [self._status_explanation(nr)]
+            if logs is not None:
+                parts.append("CloudWatch logs: " + (self._status_explanation(logs) or "-"))
+            return "\n\n".join(p for p in parts if p)
+        if column in ("value", "threshold"):
+            return self._status_explanation(nr)
+        if column == "logs" and logs is not None:
+            return self._status_explanation(logs)
+        state = logs if column == "logerrs" else nr if column == "errors" else None
+        if state is None or not state.records:
+            return None
+        hint = "\n\nClick the row for the full details below the table; double-click this cell for the inbox."
+        return self._latest_record_text(state) + hint
+
+    def _latest_record_text(self, state):
+        """The newest record in full -- nothing truncated -- for tooltips and the details panel."""
+        count = len(state.records)
+        if state.kind == "logs":
+            rec = state.log_records[0]
+            return (f"CloudWatch: {count} error log line{'s' if count != 1 else ''} this session. Latest:\n\n"
+                    f"{rec.level}: {rec.message}\n\n"
+                    f"Request: {(rec.method + ' ' + rec.url).strip() or '-'}\n"
+                    f"ECS task: {rec.task_id or '-'}\n"
+                    f"Time: {ErrorInboxDialog._fmt_time(rec.timestamp)}")
+        rec = state.error_records[0]
+        status = rec.status_code if rec.status_code is not None else "-"
+        return (f"New Relic: {count} error{'s' if count != 1 else ''} this session. Latest:\n\n"
+                f"{rec.error_class}\n{rec.error_message}\n\n"
+                f"Endpoint: {(rec.method or '') + ' ' + rec.endpoint if rec.method else rec.endpoint}\n"
+                f"HTTP status: {status}\nContainer: {rec.container}\n"
+                f"Time: {ErrorInboxDialog._fmt_time(rec.timestamp)}")
 
     def _status_explanation(self, state):
         breached = self._breached_metrics(state)
         titles = {key: title for key, title, _select in OVERVIEW_METRICS}
         lines = []
+        window_min = self.cfg.settings.cloudwatch_lookback_seconds / 60
         if state.status == "ERROR":
             lines.append(f"Query error:\n{state.error or 'unknown error'}")
         elif state.status == "ANOMALY" and state.value is not None and state.threshold is not None:
-            lines.append(f"Anomaly: error rate {state.value:.2f}% is above the {state.threshold:.2f}% threshold.")
+            if state.kind == "logs":
+                lines.append(f"Anomaly: {state.value:.0f} error log lines in the last {window_min:g} min, "
+                             f"above the threshold of {state.threshold:.1f}.")
+            else:
+                lines.append(f"Anomaly: error rate {state.value:.2f}% is above the {state.threshold:.2f}% threshold.")
         elif state.status == "PENDING":
             lines.append("Waiting for the first results…")
         elif state.status == "OK":
-            lines.append("Error rate is within its threshold.")
+            if state.kind == "logs":
+                lines.append(f"{state.value:.0f} error log lines in the last {window_min:g} min, within the "
+                             f"threshold of {state.threshold:.1f}." if state.value is not None else
+                             "Error log lines are within their threshold.")
+            else:
+                lines.append("Error rate is within its threshold.")
         if breached:
             lines.append("Chart threshold breached: " + ", ".join(titles[k] for k in sorted(breached)))
         return "\n\n".join(lines) or None
 
+    # ---------- details panel (click a row) ----------
+    def _build_details_panel(self, parent):
+        """Full, untruncated latest New Relic error and CloudWatch log line for the selected row,
+        as selectable text, so it can be read and copied without leaving the dashboard."""
+        self.details_frame = ttk.LabelFrame(parent, text="Details", padding=self._px(10))
+        bar = ttk.Frame(self.details_frame)
+        bar.pack(fill="x", pady=(0, self._px(6)))
+        self.details_title = ttk.Label(bar, style="Strong.TLabel")
+        self.details_title.pack(side="left")
+        ttk.Button(bar, text="Clear", command=self._clear_details).pack(side="right")
+        self.details_log_btn = ttk.Button(bar, text="Open Log Inbox (CloudWatch)",
+                                          command=lambda: self.open_error_inbox(logs_key(self._details_row[4:])))
+        self.details_log_btn.pack(side="right", padx=(0, self._px(6)))
+        self.details_err_btn = ttk.Button(bar, text="Open Error Inbox (New Relic)",
+                                          command=lambda: self.open_error_inbox(self._details_row))
+        self.details_err_btn.pack(side="right", padx=(0, self._px(6)))
+        body = ttk.Frame(self.details_frame)
+        body.pack(fill="both", expand=True)
+        self.details_text = tk.Text(body, width=60, height=9, wrap="word", borderwidth=0, highlightthickness=0,
+                                    font="TkDefaultFont", padx=4, pady=4, state="disabled")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.details_text.yview)
+        self.details_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.details_text.pack(side="left", fill="both", expand=True)
+        self.bind("<Escape>", lambda e: self._clear_details(), add="+")
+
+    def _show_details(self, row):
+        self._details_row = row
+        self._details_text_cache = None
+        self._render_details()
+
+    def _clear_details(self):
+        """The panel always stays visible; with no row selected it shows a prompt instead."""
+        self._details_row = None
+        self._details_text_cache = None
+        if self.tree.selection():
+            self.tree.selection_remove(self.tree.selection())
+        self.details_title.config(text="No row selected")
+        self.details_err_btn.config(state="disabled")
+        self.details_log_btn.config(state="disabled")
+        self._write_details([("Details", "Select a row in the table to see its latest New Relic error "
+                                         "and CloudWatch log line here.")])
+
+    def _render_details(self):
+        row = self._details_row
+        if row is None:
+            return
+        nr, logs = self._row_states(row)
+        if nr is None:
+            self._clear_details()
+            return
+        self.details_title.config(text=nr.name)
+        self.details_err_btn.config(state="normal" if nr.error_records else "disabled")
+        if logs is not None:
+            self.details_log_btn.pack(side="right", padx=(0, self._px(6)), before=self.details_err_btn)
+            self.details_log_btn.config(state="normal" if logs.log_records else "disabled")
+        else:
+            self.details_log_btn.pack_forget()
+
+        sections = []
+        if nr.error_records:
+            sections.append(("New Relic — latest error", self._latest_record_text(nr)))
+        elif nr.kind == "location":
+            sections.append(("New Relic", "No errors captured this session."))
+        else:
+            sections.append(("Group", self._status_explanation(nr) or "-"))
+        if logs is not None:
+            if logs.log_records:
+                rec = logs.log_records[0]
+                sections.append(("CloudWatch — latest error log line", self._latest_record_text(logs)))
+                sections.append(("Full log line", rec.raw))
+            else:
+                sections.append(("CloudWatch", "No error log lines captured this session."
+                                 if logs.status != "ERROR" else f"Can't read logs: {logs.error}"))
+        # Only rewrite when something changed, so a selection being copied isn't wiped every poll.
+        if sections == self._details_text_cache:
+            return
+        self._details_text_cache = sections
+        self._write_details(sections)
+
+    def _write_details(self, sections):
+        pal = self.palette
+        text = self.details_text
+        text.config(state="normal", bg=pal["surface"], fg=pal["fg"], selectbackground=pal["select"],
+                    selectforeground=pal["fg"])
+        text.delete("1.0", "end")
+        text.tag_configure("heading", font="SunValleyBodyStrongFont", spacing1=6)
+        text.tag_configure("raw", font="TkFixedFont")
+        for heading, body in sections:
+            text.insert("end", f"{heading}\n", "heading")
+            text.insert("end", f"{body}\n\n", "raw" if heading == "Full log line" else ())
+        text.config(state="disabled")  # read-only, but still selectable and copyable
+
     # ---------- widgets layered over the grid ----------
-    def _remove_error_overlay(self, iid):
-        overlay = self._error_cell_overlays.pop(iid, None)
+    def _remove_error_overlay(self, key):
+        overlay = self._error_cell_overlays.pop(key, None)
         if overlay is not None:
             overlay.destroy()
 
@@ -1553,65 +2564,128 @@ class App(tk.Tk):
             x, y, width, height = bbox
             sep.place(x=x, y=y + height - 1, width=width, height=1)
 
+    def _over_threshold(self, key):
+        state = self.monitor.states.get(key)
+        return state is not None and state.status == "ANOMALY"
+
+    def _blend(self, start, end, t):
+        a, b = self.winfo_rgb(start), self.winfo_rgb(end)
+        return "#" + "".join(f"{round(x + (y - x) * t) >> 8:02x}" for x, y in zip(a, b))
+
     def _sync_error_overlays(self):
+        """A series with new records since it was last opened gets its inbox cell (New Relic or
+        CloudWatch) highlighted: red, until opened, while the series is over its threshold;
+        otherwise a green blip that holds for NEW_ERROR_HOLD_S then fades back into the row."""
         self._sync_row_separators()
-        for iid in list(self._error_cell_overlays.keys()):
-            if iid not in self._new_error_iids or not self.tree.exists(iid):
-                self._remove_error_overlay(iid)
-        for iid in self._new_error_iids:
-            if not self.tree.exists(iid):
+        pal, now = self.palette, time.monotonic()
+        next_tick_s = None
+        for key in list(self._new_error_iids):
+            if self._over_threshold(key):
+                self._new_error_at[key] = now  # once back under, the green blip runs from here
                 continue
-            bbox = self.tree.bbox(iid, "errors")
-            overlay = self._error_cell_overlays.get(iid)
+            elapsed = now - self._new_error_at.get(key, now)
+            if elapsed >= NEW_ERROR_HOLD_S + NEW_ERROR_FADE_S:
+                self._new_error_iids.discard(key)
+                self._new_error_at.pop(key, None)
+            else:
+                wait = NEW_ERROR_FADE_FRAME_MS / 1000 if elapsed >= NEW_ERROR_HOLD_S else NEW_ERROR_HOLD_S - elapsed
+                next_tick_s = wait if next_tick_s is None else min(next_tick_s, wait)
+        for key in list(self._error_cell_overlays.keys()):
+            if key not in self._new_error_iids or not self.tree.exists(self._row_for(key)):
+                self._remove_error_overlay(key)
+        for key in self._new_error_iids:
+            row, column = self._row_for(key), self._cell_for(key)
+            if not self.tree.exists(row):
+                continue
+            bbox = self.tree.bbox(row, column)
+            overlay = self._error_cell_overlays.get(key)
             if not bbox:
                 if overlay is not None:
                     overlay.place_forget()
                 continue
-            text = self.tree.set(iid, "errors")
+            if self._over_threshold(key):
+                bg, fg = pal["new_error_alert_bg"], pal["new_error_fg"]
+            else:
+                bg, fg = pal["new_error_bg"], pal["new_error_fg"]
+                fade = (now - self._new_error_at.get(key, now) - NEW_ERROR_HOLD_S) / NEW_ERROR_FADE_S
+                if fade > 0:
+                    tags = self.tree.item(row, "tags")
+                    row_bg = (tags and self.tree.tag_configure(tags[0], "background")) or pal["surface"]
+                    bg, fg = self._blend(bg, row_bg, min(fade, 1)), self._blend(fg, pal["fg"], min(fade, 1))
+            text = self.tree.set(row, column)
             if overlay is None:
                 overlay = tk.Label(
-                    self.tree, text=text, bg=self.palette["new_error_bg"], fg=self.palette["new_error_fg"],
+                    self.tree, text=text, bg=bg, fg=fg,
                     anchor="w", font="TkDefaultFont", padx=self._px(6),
                 )
-                overlay.bind("<Double-1>", lambda e, i=iid: self._on_error_cell_double_click(i))
-                overlay.bind("<Button-1>", lambda e, i=iid: self._on_error_cell_click(i))
+                overlay.bind("<Double-1>", lambda e, k=key: self._on_error_cell_double_click(k))
+                overlay.bind("<Button-1>", lambda e, k=key: self._on_error_cell_click(k))
                 overlay.bind("<Button-3>", lambda e: self._on_dashboard_right_click())
-                overlay.bind("<Motion>", lambda e, i=iid: self._update_tree_tooltip(
-                    (i, "overlay"), e.x_root, e.y_root))
+                overlay.bind("<Motion>", lambda e, r=row, c=column: self._update_tree_tooltip(
+                    (r, c), e.x_root, e.y_root))
                 overlay.bind("<Leave>", lambda e: self._hide_tree_tooltip())
-                self._error_cell_overlays[iid] = overlay
+                self._error_cell_overlays[key] = overlay
             else:
-                overlay.config(text=text)
+                overlay.config(text=text, bg=bg, fg=fg)
             x, y, width, height = bbox
             overlay.place(x=x, y=y, width=width, height=height - 1)  # leave the row separator visible
+        if self._overlay_tick_id is not None:
+            self.after_cancel(self._overlay_tick_id)
+            self._overlay_tick_id = None
+        if next_tick_s is not None:
+            self._overlay_tick_id = self.after(max(1, int(next_tick_s * 1000)), self._on_overlay_tick)
 
-    def _on_error_cell_click(self, iid):
-        self.tree.selection_set(iid)
+    def _on_overlay_tick(self):
+        self._overlay_tick_id = None
+        self._sync_error_overlays()
+
+    def _clear_new_errors(self):
+        """Clears every series' new-records flag (the green highlights) without opening any inbox."""
+        self._new_error_iids.clear()
+        self._new_error_at.clear()
+        for key in list(self._error_cell_overlays.keys()):
+            self._remove_error_overlay(key)
+        self._hide_tree_tooltip()
+        self.mini_view.refresh()
+
+    def _on_error_cell_click(self, key):
+        self.tree.selection_set(self._row_for(key))
         self._on_dashboard_select()
 
-    def _on_error_cell_double_click(self, iid):
-        self.open_error_inbox(iid)
+    def _on_error_cell_double_click(self, key):
+        self.open_error_inbox(key)
 
     def _on_dashboard_double_click(self, event):
-        iid = self.tree.identify_row(event.y)
-        if iid:
-            self.open_error_inbox(iid)
-
-    def open_error_inbox(self, iid):
-        """Clears the series' new-error flag and opens its Error Inbox (if it has any errors)."""
-        self._new_error_iids.discard(iid)
-        self._remove_error_overlay(iid)
-        self._hide_tree_tooltip()
-        state = self.monitor.states.get(iid)
-        if not state or not state.error_records:
+        row = self.tree.identify_row(event.y)
+        if not row:
             return
-        dialog = ErrorInboxDialog(self, state)
+        column = self._column_id(self.tree.identify_column(event.x))
+        nr, logs = self._row_states(row)
+        if column in LOG_COLUMNS or (column != "errors" and nr is not None and not nr.records):
+            if logs is not None:
+                self.open_error_inbox(logs.key)
+                return
+        self.open_error_inbox(row)
+
+    def open_error_inbox(self, key):
+        """Clears the series' new-records flag and opens its inbox (Error Inbox for New Relic,
+        Log Inbox for CloudWatch) if it has any records."""
+        self._new_error_iids.discard(key)
+        self._remove_error_overlay(key)
+        self._hide_tree_tooltip()
+        state = self.monitor.states.get(key)
+        if not state or not state.records:
+            return
+        dialog = (LogInboxDialog if state.kind == "logs" else ErrorInboxDialog)(self, state)
         dialog.lift()
         dialog.focus_force()
 
     def _on_dashboard_select(self, event=None):
         sel = self.tree.selection()
-        if not sel or not sel[0].startswith("loc:"):
+        if not sel:
+            return
+        self._show_details(sel[0])
+        if not sel[0].startswith("loc:"):
             return  # groups have no chart line to highlight
         name = sel[0][len("loc:"):]
         loc = next((l for l in self.cfg.locations if l.name == name), None)
@@ -1638,7 +2712,11 @@ class App(tk.Tk):
                 self._alert_widgets[key].destroy()
                 del self._alert_widgets[key]
         for alert in active:
-            text = f"ANOMALY: {alert.name} — {alert.value:.2f}% (threshold {alert.threshold:.2f}%)"
+            if alert.key.startswith("cw:"):
+                text = (f"LOG ERROR SPIKE: {alert.name} — {alert.value:.0f} error lines "
+                        f"(threshold {alert.threshold:.1f})")
+            else:
+                text = f"ANOMALY: {alert.name} — {alert.value:.2f}% (threshold {alert.threshold:.2f}%)"
             if alert.key not in self._alert_widgets:
                 row = tk.Frame(self.alert_banner, bg="#b00020")
                 tk.Label(row, fg="white", bg="#b00020", text=text, font="SunValleyBodyStrongFont").pack(
@@ -1664,9 +2742,10 @@ class App(tk.Tk):
         self.focus_force()
         if focus_key is not None:
             tab = self.dashboard_tab
-            if self.tree.exists(focus_key):
-                self.tree.selection_set(focus_key)
-                self.tree.see(focus_key)
+            row = self._row_for(focus_key)
+            if self.tree.exists(row):
+                self.tree.selection_set(row)
+                self.tree.see(row)
         if tab is not None:
             self.notebook.select(tab)
 

@@ -20,7 +20,9 @@ class SessionLogger:
         return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def event(self, level: str, message: str) -> None:
-        line = f"[{self._timestamp()}] {level:<7} {message}\n"
+        # Exception messages and log lines can contain newlines; keep each entry on one line.
+        message = " ".join(message.split())
+        line =f"[{self._timestamp()}] {level:<7} {message}\n"
         with self._lock:
             with self.log_path.open("a", encoding="utf-8") as f:
                 f.write(line)

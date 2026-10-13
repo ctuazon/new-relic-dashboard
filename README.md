@@ -52,6 +52,21 @@ etc.
   shown in 12-hour clock format, error class, message, endpoint, HTTP
   method/status, and which container it came from), which also clears the
   highlight
+- **CloudWatch error logs per realm** (optional) — reads the realms'
+  shared ECS log group (`marketplace-prod-logs` by default) once a minute,
+  splits the matching lines by site hostname, and adds **Log Errors** and
+  **Log Inbox** columns to each location's row. Log Errors is the number
+  of PHP error lines in the last 5 minutes against its threshold, and it
+  alerts (banner, beep, spoken name) through the same thresholds as the
+  error rate. Double-click the Log Inbox cell for every line, the request
+  URL, the ECS task and the raw log line
+- **CloudTrail change feed** (optional, display only) — a CloudTrail tab
+  listing every ECS deploy, scale, create/delete and task stop on the
+  Marketplace, SSR and Search API prod clusters, plus the SSR and Search
+  API PR environments in the dev account, over the last week: when, which service, what changed and who
+  did it (Jenkins, a GitHub Actions workflow, a person). Deploys are also
+  drawn as dotted markers on the charts, so a spike can be lined up with
+  the deploy before it
 - **Session logs** — every run writes a timestamped, human-readable `.log`
   and a numeric-readings `.csv`, viewable live in the Logs tab
 - **One-click installer** (`install.bat` / `install.ps1`) that sets up the
@@ -100,13 +115,29 @@ pip install -r requirements.txt
 
 Then fill in `.env` as above and run `python main.py`.
 
+### CloudWatch logs (AWS login)
+
+CloudWatch tracking reads logs with your own AWS SSO login. Click **AWS
+Login** in the top bar (or answer Yes when Start Monitoring says the login
+has expired): your browser opens to approve it, and the logs rows pick up
+straight away. It runs `aws sso login --profile <profile>` for you, so it
+needs the AWS CLI v2 installed.
+
+The profile needs read-only `logs:FilterLogEvents` and
+`logs:DescribeLogGroups` on the log group, and for the CloudTrail tab
+`cloudtrail:LookupEvents` and `sts:GetCallerIdentity`. `xforce` (Marketplace prod,
+us-east-1) is the default; change it on the Settings tab.
+
 ## Using it
 
 ### Top bar
 
 - **Test Connection** — validates the API key and (if an account ID is set)
   runs a real NRQL query against it. The light turns yellow while testing,
-  green on success, red on failure (with the reason shown next to it).
+  green on success, red on failure (with the reason shown next to it). If
+  CloudWatch tracking is on, the AWS login and log group are checked too
+  and the result is appended to the message; a CloudWatch failure doesn't
+  turn the light red or stop New Relic monitoring from starting.
 - **Start Monitoring / Stop Monitoring** — tests the connection first, then
   begins polling every location and group on the configured interval. While
   waiting for the first results, the dashboard shows "Loading..." rows and a
@@ -114,14 +145,37 @@ Then fill in `.env` as above and run `python main.py`.
 - **Refresh Now** — polls immediately instead of waiting for the next
   scheduled interval. If monitoring isn't running yet, this starts it.
 - **Silence All** — acknowledges every currently active alert at once.
+- **AWS Login** — logs in to AWS for CloudWatch and CloudTrail (`aws sso
+  login` for the profiles on the Settings tab, once per SSO session). Prod
+  (`xforce`) and the dev account with the PR environments use different
+  SSO sessions, so expect two browser approvals. Your browser opens to approve it; once
+  done, the connection is rechecked and the logs are read immediately.
 
 ### Dashboard tab
 
-The table lists every location and group with its current error rate,
-threshold, status (`OK` / `ANOMALY` / `ERROR`), last-updated time (12-hour
-clock, e.g. `1:05:03 PM`), and an Error Inbox summary column. Rows
-highlight red on anomaly, and also on a chart-metric breach (see below)
-even if the error-rate itself is fine.
+The table has one row per location (plus groups) with:
+
+- **Status**: the worse of New Relic and CloudWatch (`OK` / `Anomaly` /
+  `Error` / `Warning`). Hover it for both explanations.
+- **Error Rate / Threshold**: New Relic.
+- **Log Errors**: CloudWatch error lines in the count window against
+  their threshold, e.g. `12 / 100`. `⚠ error` means the logs couldn't be
+  read (usually an expired AWS login); it doesn't turn the row red.
+- **Last Updated** (12-hour clock, e.g. `1:05:03 PM`; hidden when the
+  window is narrow).
+- **Error Inbox (New Relic)** and **Log Inbox (CloudWatch)**: a summary
+  of the latest record, cut to fit the column.
+
+Rows highlight red on anomaly, and also on a chart-metric breach (see
+below) even if the error rate itself is fine.
+
+**Reading the full exception without leaving the dashboard:**
+
+- **Hover** an inbox cell for the latest record in full.
+- **Click** a row to open the **Details** panel under the table: the full
+  latest New Relic error and CloudWatch log line (including the raw line
+  with file paths), as selectable text you can copy. **Open Error Inbox**
+  / **Open Log Inbox** jump to the full lists; **Hide** or Esc closes it.
 
 - **Click a location's row** to isolate that service everywhere in the
   charts below (same effect as clicking its legend name) — the row stays
@@ -153,6 +207,50 @@ Double-click a row's Error Inbox cell (or the row itself, if it has
 records) to open the full list of individual errors caught for that
 location this session, with a detail panel per error.
 
+With CloudWatch tracking on, **Log Errors** is the number of matching
+error lines in the count window (default 5 minutes), and its threshold
+works like the error rate's (automatic from this session's history, with
+a fallback until enough samples exist). A spike raises a **LOG ERROR
+SPIKE** banner and the spoken alert. The Log Inbox cell turns green on
+new lines; double-click it for the **Log Inbox**. In the Mini View a
+location's logs only get their own item while they're alerting.
+
+How lines are matched: all the trader sites log to one ECS log group as
+nginx output. PHP messages come through as `[error] ... PHP message:
+[...] marketplace.<LEVEL>: ...`. nginx tags every PHP message `[error]`,
+NOTICEs included, so the filter keys on the Monolog level instead
+(`marketplace.ERROR` and above, plus `PHP Fatal`). Each line is assigned
+to a realm by its `host: "www.<site>.com"`.
+
+### CloudTrail tab
+
+A CloudTrail feed of ECS changes on the watched clusters, newest first:
+time, app (Marketplace / SSR / Search API), service, what changed, and who
+did it. Select a row for the details, including the full CloudTrail event.
+
+- **Deploy**: a new task definition revision (Marketplace via Jenkins) or
+  a forced redeploy (SSR and Search API via GitHub Actions). Shown in bold
+  and as dotted markers on the dashboard charts; hover a marker for which
+  deploy it was.
+- **Scale**: Auto Scaling changing the task count. These happen hundreds
+  of times a week, so they're hidden unless **Show Auto Scaling** is on.
+- **Create / Delete / Stop task / Failed**: service created or deleted, a
+  task stopped by hand, or any of these calls failing (in red).
+
+PR environments are listed as **SSR PRs** (services `marketplace-ssr-prN`
+in the shared `marketplace-ssr-pr` cluster) and **Search API PRs** (a
+cluster per PR, `mp-sapi-pr-env-N`, so its start and teardown show too).
+They're in the dev account (profile `MarketplaceDevs-toldev-729320268350`)
+and aren't marked on the prod charts. Red "FAILED ... ServiceNotFound" rows
+there are usually a workflow redeploying a PR whose environment was
+already removed.
+
+Nothing here raises an alert. Hover the ⓘ next to the status line for how
+fresh it is: after Start, prod changes appear in about 25 seconds and the
+PR environments take about 2–3 minutes to fill in. After that it checks
+every 2 minutes. CloudTrail itself can take up to about 15 minutes to
+deliver an event, so a deploy may appear a little after it happened.
+
 ### Locations & Groups tab
 
 Add, edit, or remove **Locations** (name + NRQL query, optionally a custom
@@ -165,6 +263,10 @@ column, e.g.:
 SELECT percentage(count(*), WHERE error IS true) AS 'errorRate'
 FROM Transaction WHERE appName = 'Checkout Service' SINCE 5 minutes ago
 ```
+
+Each location also has a **CloudWatch log host**: the site's hostname in
+the logs. Left blank, it's `www.<name>.com` (`RVTrader (ECS)` becomes
+`www.rvtrader.com`). TruckTrader is set to `www.commercialtrucktrader.com`.
 
 **Important for charts and Errors Inbox:** those two features key off the
 actual New Relic `appName` your location is filtering on. Include
@@ -193,6 +295,35 @@ leave that location's chart lines and error inbox empty.
   instances of the same app.
 - Region and Account ID are shown read-only here as a reminder; change them
   in `.env` and restart to apply.
+Settings are split into three sub-tabs (General, CloudWatch Logs,
+CloudTrail); **Save Settings** below them saves all three.
+
+- **CloudWatch Logs** (applies on the next Start):
+  - **Track CloudWatch error logs per realm**: on/off.
+  - **AWS profile / region / log group**: where the logs are read from
+    (defaults `xforce`, `us-east-1`, `marketplace-prod-logs`).
+  - **Filter pattern**: a CloudWatch filter pattern selecting the lines
+    to count. The default matches Monolog ERROR and above, plus PHP fatals.
+  - **Ignore lines containing**: `;`-separated text. Lines containing
+    any of it are dropped before counting, for known noise that's already
+    ticketed.
+  - **Count window**: how many seconds of logs each count covers (300).
+  - **Poll interval**: how often CloudWatch is read (60 seconds).
+  - **Min error lines before alerting**: a spike smaller than this never
+    alerts, so a quiet site going from 0 to 2 lines stays silent (10).
+  - **Fallback threshold**: the line-count threshold used until a realm
+    has enough history for its automatic one (100).
+- **CloudTrail** (applies on the next Start):
+  - **Show ECS deploys/changes**: on/off.
+  - **History to show**: hours of changes to load (168, a week; up to 90
+    days).
+  - **Poll interval**: how often CloudTrail is checked (120 seconds).
+  - **Clusters to watch**: one per line, `label | cluster | service prefix
+    | profile | region | charts`. Leave the service prefix empty for every
+    service in the cluster; profile and region default to `xforce` /
+    `us-east-1`. End the cluster with `*` to cover every cluster with that
+    prefix (e.g. `mp-sapi-pr-env-*`). `charts` is `yes`/`no`: whether its
+    deploys are marked on the dashboard charts.
 
 ### Logs tab
 

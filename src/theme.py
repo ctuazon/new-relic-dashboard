@@ -34,7 +34,7 @@ PALETTES = {
         "chart_bg": "#fafafa", "chart_grid": "#e6e6e6", "series_neutral": "#000000",
         "mini_bg": "#ffffff", "mini_alert_bg": "#ffe0e0", "mini_border": "#c8c8c8",
         "mini_fg": "#222222", "mini_muted": "#888888", "mini_new_error": "#7b1fa2",
-        "new_error_bg": "#0b3d0b", "new_error_fg": "#ffffff",
+        "new_error_bg": "#0b3d0b", "new_error_fg": "#ffffff", "new_error_alert_bg": "#b71c1c",
     },
     "dark": {
         "bg": "#1c1c1c", "surface": "#232323", "fg": "#fafafa", "muted": "#a8a8a8",
@@ -46,7 +46,7 @@ PALETTES = {
         "chart_bg": "#1c1c1c", "chart_grid": "#333333", "series_neutral": "#e0e0e0",
         "mini_bg": "#232323", "mini_alert_bg": "#4a1f22", "mini_border": "#4a4a4a",
         "mini_fg": "#eeeeee", "mini_muted": "#9a9a9a", "mini_new_error": "#ce93d8",
-        "new_error_bg": "#2e7d32", "new_error_fg": "#ffffff",
+        "new_error_bg": "#2e7d32", "new_error_fg": "#ffffff", "new_error_alert_bg": "#c62828",
     },
 }
 
